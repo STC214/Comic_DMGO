@@ -1,0 +1,8 @@
+{
+  "engine": "rod",
+  "proxy": "",
+  "maxPages": 100,
+  "retries": 3,
+  "requestDelayMs": 250,
+  "pageTimeoutSeconds": 90
+}

@@ -1,0 +1,101 @@
+# Build outputs and release packages
+/dist/*
+!/dist/go.mod
+/bin/
+/release/
+/portable/
+/artifacts/
+/Comic_PC.exe
+/*.exe
+/*.zip
+/*.7z
+/*.rar
+/*.tar
+/*.gz
+/*.tgz
+
+# Runtime state, downloads, profiles, and logs
+/runtime/*
+!/runtime/go.mod
+/download/
+/downloads/
+/logs/
+/profile/
+*.part
+*.crdownload
+
+# Local application state (keep the checked-in default config.json)
+/tasks.json
+/state.json
+/settings.local.json
+/config.local.json
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Go build caches and diagnostics
+/.gocache/
+/.gomodcache/
+/.gotmp/
+/.tmp/
+/.tmp-go/
+/.tmpgo/
+/.chromium-download/
+/tmp/
+/tmpgo/
+*.test
+*.prof
+*.pprof
+/coverage.out
+/coverage.html
+/coverage/
+/go.work
+/go.work.sum
+
+# Python caches, virtual environments, and test reports
+__pycache__/
+*.py[cod]
+*.pyd
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+/.venv/
+/venv/
+/env/
+
+# Local configuration and secrets
+/.env
+/.env.*
+!/.env.example
+
+# Editors and operating-system metadata
+/.vscode/
+/.idea/
+*.code-workspace
+.fleet/
+.vs/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Generated helper and temporary files
+/*_stdout.txt
+/*_stderr.txt
+*.log
+*.jsonl
+*.syso
+*.bak
+*.tmp
+*.old
+*.orig
+*.swp
+*.swo
+*~
+
+# Local sample and regression artifacts
+/01.png
+/tmp_unicode_test.txt
