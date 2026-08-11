@@ -164,6 +164,8 @@ type fakeMyreadingBrowser struct {
 	closed       bool
 }
 
+func (b *fakeMyreadingBrowser) SetVisible(bool) error { return nil }
+
 func (b *fakeMyreadingBrowser) Snapshot(context.Context, string) (myreadingSnapshot, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -331,8 +333,16 @@ func TestRodHeadedRealChromeSmoke(t *testing.T) {
 	rodBrowser := browser.(*rodMyreadingBrowser)
 	defer browser.Close()
 	joined := strings.Join(rodBrowser.process.cmd.Args, " ")
-	if strings.Contains(joined, "--headless") || strings.Contains(joined, "--enable-automation") || strings.Contains(joined, "--window-size") || strings.Contains(joined, "--lang=") {
+	if strings.Contains(joined, "--headless") || strings.Contains(joined, "--enable-automation") || strings.Contains(joined, "--lang=") {
 		t.Fatalf("headed real-browser arguments contain automation mode: %s", joined)
+	}
+	for _, required := range []string{"--window-position=-32000,-32000", "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("headed hidden-start argument missing %s: %s", required, joined)
+		}
+	}
+	if rodBrowser.process.WindowVisible() {
+		t.Fatal("headed browser was visible before verification")
 	}
 	metrics, err := rodBrowser.page.Eval(`() => ({outerWidth, outerHeight, innerWidth, innerHeight, devicePixelRatio})`)
 	if err != nil {
@@ -350,6 +360,12 @@ func TestRodHeadedRealChromeSmoke(t *testing.T) {
 	if !snap.Verification {
 		t.Fatalf("challenge snapshot=%+v", snap)
 	}
+	if err := browser.SetVisible(true); err != nil {
+		t.Fatal(err)
+	}
+	if !rodBrowser.process.WindowVisible() {
+		t.Fatal("verification browser did not become visible")
+	}
 	time.Sleep(time.Second)
 	if rodBrowser.process.cmd.ProcessState != nil && rodBrowser.process.cmd.ProcessState.Exited() {
 		t.Fatal("headed browser exited while waiting for verification")
@@ -363,11 +379,28 @@ func TestRealMyreadingFirstBrowserResourceSmoke(t *testing.T) {
 	bin := os.Getenv("MYREADING_BROWSER_BIN")
 	profile := os.Getenv("MYREADING_BROWSER_PROFILE")
 	target := os.Getenv("MYREADING_REAL_URL")
-	browser, err := newRodMyreadingBrowser(bin, profile, false, "")
+	engine := strings.TrimSpace(os.Getenv("MYREADING_REAL_ENGINE"))
+	if engine == "" {
+		engine = "rod"
+	}
+	browser, err := newMyreadingBrowser(engine, bin, profile, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer browser.Close()
+	switch current := browser.(type) {
+	case *rodMyreadingBrowser:
+		if current.process.WindowVisible() {
+			t.Fatal("Rod browser window became visible during hidden startup")
+		}
+	case *playwrightMyreadingBrowser:
+		if current.process.WindowVisible() {
+			t.Fatal("Playwright browser window became visible during hidden startup")
+		}
+	}
+	if err := browser.SetVisible(false); err != nil {
+		t.Fatalf("hide real browser: %v", err)
+	}
 	snap, err := browser.Snapshot(context.Background(), target)
 	if err != nil {
 		t.Fatal(err)
@@ -375,16 +408,26 @@ func TestRealMyreadingFirstBrowserResourceSmoke(t *testing.T) {
 	if snap.Verification || len(snap.Images) == 0 {
 		t.Fatalf("real snapshot title=%q verification=%v images=%d", snap.Title, snap.Verification, len(snap.Images))
 	}
-	payload, contentType, err := browser.Resource(context.Background(), snap.Images[0])
-	if err != nil {
-		t.Fatal(err)
+	limit := 1
+	if os.Getenv("MYREADING_REAL_ALL_RESOURCES") == "1" {
+		limit = len(snap.Images)
 	}
-	path := filepath.Join(t.TempDir(), "first.part")
-	if err := os.WriteFile(path, payload, 0o644); err != nil {
-		t.Fatal(err)
+	temp := t.TempDir()
+	var total int64
+	for i, rawURL := range snap.Images[:limit] {
+		payload, contentType, resourceErr := browser.Resource(context.Background(), rawURL)
+		if resourceErr != nil {
+			t.Fatalf("resource %d/%d: %v", i+1, limit, resourceErr)
+		}
+		path := filepath.Join(temp, fmt.Sprintf("%04d.part", i+1))
+		if err := os.WriteFile(path, payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateDownloadedImage(path, contentType); err != nil {
+			t.Fatalf("resource %d/%d bytes=%d contentType=%q err=%v", i+1, limit, len(payload), contentType, err)
+		}
+		total += int64(len(payload))
+		t.Logf("real browser resource %d/%d bytes=%d", i+1, limit, len(payload))
 	}
-	if err := validateDownloadedImage(path, contentType); err != nil {
-		t.Fatalf("browser resource bytes=%d contentType=%q err=%v", len(payload), contentType, err)
-	}
-	t.Logf("real browser resource title=%q images=%d firstBytes=%d contentType=%q", snap.Title, len(snap.Images), len(payload), contentType)
+	t.Logf("real browser resource engine=%s title=%q images=%d verified=%d totalBytes=%d", engine, snap.Title, len(snap.Images), limit, total)
 }

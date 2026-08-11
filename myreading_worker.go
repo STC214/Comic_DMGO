@@ -81,6 +81,7 @@ type myreadingBrowser interface {
 	Snapshot(ctx context.Context, target string) (myreadingSnapshot, error)
 	CurrentSnapshot(ctx context.Context) (myreadingSnapshot, error)
 	Resource(ctx context.Context, rawURL string) ([]byte, string, error)
+	SetVisible(visible bool) error
 	Cookies(ctx context.Context) ([]browserCookie, error)
 	Close()
 }
@@ -179,6 +180,12 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 		m.setState(id, TaskError, .04, cfg.Engine+" start: "+err.Error())
 		return
 	}
+	// Keep the real headed Chrome process (and therefore its verified rendering
+	// behavior), but hide its native window until a challenge actually needs the
+	// user's input. Hiding does not change the page viewport or browser mode.
+	if hideErr := browser.SetVisible(false); hideErr != nil {
+		log.Printf("myreading initial browser hide warning id=%d err=%v", id, hideErr)
+	}
 	control := &goMyreadingControl{cancel: cancel, browser: browser}
 	m.registerActiveWorker(id, control)
 	defer m.unregisterActiveWorker(id, control)
@@ -208,6 +215,9 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 		}
 		snap.Verification = snap.Verification || isMyreadingVerificationSnapshot(snap)
 		if snap.Verification {
+			if showErr := browser.SetVisible(true); showErr != nil {
+				log.Printf("myreading verification browser show warning id=%d err=%v", id, showErr)
+			}
 			m.setState(id, TaskWaitingVerification, .1, "complete verification in the visible browser")
 			if browserHeadless {
 				control.ReleaseBrowser()
@@ -255,6 +265,9 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 				return
 			}
 			m.setStateIfCurrent(id, TaskWaitingVerification, TaskRunning, .12, "verification complete; collecting reader")
+			if hideErr := browser.SetVisible(false); hideErr != nil {
+				log.Printf("myreading verified browser hide warning id=%d err=%v", id, hideErr)
+			}
 			verificationCompleted = true
 			snap, snapErr = browser.Snapshot(ctx, current)
 			if snapErr != nil {
@@ -274,7 +287,7 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 			}
 		}
 		for _, raw := range snap.Images {
-			if u := normalizeImageURL(raw); u != "" && !seenImages[u] {
+			if u := normalizeImageURL(raw); u != "" && isProbablyMyreadingContentImage(u) && !seenImages[u] {
 				seenImages[u] = true
 				images = append(images, u)
 			}
@@ -335,6 +348,26 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 		"output_dir": out, "expected_pages": len(images), "downloaded_pages": downloaded, "bytes": totalBytes}
 	adapter.handleResult(m, id, task, result, out)
 	log.Printf("myreading Go engine complete id=%d engine=%s images=%d bytes=%d output=%s", id, cfg.Engine, downloaded, totalBytes, out)
+}
+
+func isProbablyMyreadingContentImage(rawURL string) bool {
+	lowered := strings.ToLower(strings.TrimSpace(rawURL))
+	for _, marker := range []string{"logo", "icon", "avatar", "sprite", "banner", "advert", "ads", "ad-", "emoji", "blank", "pixel", "200x280"} {
+		if strings.Contains(lowered, marker) {
+			return false
+		}
+	}
+	u, err := url.Parse(lowered)
+	if err != nil {
+		return false
+	}
+	path := u.Path
+	for _, ext := range []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".svg"} {
+		if strings.HasSuffix(path, ext) {
+			return true
+		}
+	}
+	return strings.Contains(path, "/uploads/") || strings.Contains(path, "/wp-content/") || strings.Contains(path, "/image/") || strings.Contains(path, "/img/")
 }
 
 func isMyreadingChallengeTitle(title string) bool {
@@ -431,6 +464,18 @@ func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, imag
 			return i, totalBytes, err
 		}
 		var last error
+		// Match the established downloader: a complete existing page is reusable,
+		// so a retry resumes at the first missing/corrupt image.
+		existing := filepath.Join(out, fmt.Sprintf("%04d%s", i+1, imageExtension(raw, "")))
+		if info, statErr := os.Stat(existing); statErr == nil && info.Mode().IsRegular() {
+			if validationErr := validateDownloadedImage(existing, ""); validationErr == nil {
+				totalBytes += info.Size()
+				progress(i+1, len(images), totalBytes)
+				log.Printf("myreading browser resource reused image=%d/%d bytes=%d", i+1, len(images), info.Size())
+				continue
+			}
+			_ = os.Remove(existing)
+		}
 		if browser != nil {
 			payload, contentType, resourceErr := browser.Resource(ctx, raw)
 			if resourceErr == nil {

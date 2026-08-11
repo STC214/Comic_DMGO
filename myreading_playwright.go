@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
@@ -14,6 +13,7 @@ type playwrightMyreadingBrowser struct {
 	browser playwright.Browser
 	ctx     playwright.BrowserContext
 	page    playwright.Page
+	cdp     playwright.CDPSession
 	process *manualChromiumProcess
 }
 
@@ -51,7 +51,14 @@ func newPlaywrightMyreadingBrowser(bin, profile string, headless bool, proxy str
 		pw.Stop()
 		return nil, fmt.Errorf("manual Chromium opened without a page")
 	}
-	return &playwrightMyreadingBrowser{pw: pw, browser: browser, ctx: ctx, page: page, process: process}, nil
+	cdp, err := ctx.NewCDPSession(page)
+	if err != nil {
+		_ = browser.Close()
+		process.Close()
+		_ = pw.Stop()
+		return nil, fmt.Errorf("attach page CDP session: %w", err)
+	}
+	return &playwrightMyreadingBrowser{pw: pw, browser: browser, ctx: ctx, page: page, cdp: cdp, process: process}, nil
 }
 func (b *playwrightMyreadingBrowser) Snapshot(ctx context.Context, target string) (myreadingSnapshot, error) {
 	select {
@@ -105,23 +112,40 @@ func (b *playwrightMyreadingBrowser) Resource(ctx context.Context, rawURL string
 		return nil, "", ctx.Err()
 	default:
 	}
-	value, err := b.page.Evaluate(`async (url) => {
-		const response = await fetch(url, {credentials:'include', cache:'force-cache', redirect:'follow'});
-		if (!response.ok) return {ok:false, error:'HTTP '+response.status};
-		const bytes = new Uint8Array(await response.arrayBuffer());
-		let binary = ''; const chunk = 0x8000;
-		for (let i=0; i<bytes.length; i+=chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i,i+chunk));
-		return {ok:true, contentType:response.headers.get('content-type')||'', base64:btoa(binary)};
+	if b.page == nil {
+		return nil, "", errBrowserClosed
+	}
+	if b.cdp != nil {
+		if _, err := b.cdp.Send("Network.setCacheDisabled", map[string]any{"cacheDisabled": true}); err != nil {
+			return nil, "", err
+		}
+	}
+	var value any
+	response, err := b.page.ExpectResponse(func(responseURL string) bool {
+		return responseURL == rawURL
+	}, func() error {
+		var evaluateErr error
+		value, evaluateErr = b.page.Evaluate(`async (url) => {
+		const absolute = value => { try { return new URL(value || '', location.href).href; } catch (_) { return ''; } };
+		const attrs = el => ['data-src','data-lazy-src','data-original','src'].map(name => absolute(el.getAttribute(name)));
+		const image = Array.from(document.images).find(el => absolute(el.currentSrc) === url || attrs(el).includes(url));
+		if (!image) return {ok:false, error:'reader image element not found'};
+		image.loading='eager'; image.scrollIntoView({block:'center', inline:'nearest'});
+		image.removeAttribute('srcset'); image.removeAttribute('data-srcset'); image.removeAttribute('data-lazy-srcset');
+		image.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+		await new Promise(resolve => setTimeout(resolve, 30));
+		const loaded = await new Promise(resolve => { const timer=setTimeout(()=>resolve(false),30000); image.onload=()=>{clearTimeout(timer);resolve(image.naturalWidth>1)}; image.onerror=()=>{clearTimeout(timer);resolve(false)}; image.src=url; });
+		return loaded ? {ok:true} : {ok:false, error:'reader image load failed'};
 	}`, rawURL)
+		return evaluateErr
+	}, playwright.PageExpectResponseOptions{Timeout: playwright.Float(45_000)})
 	if err != nil {
 		return nil, "", err
 	}
 	encoded, _ := json.Marshal(value)
 	var result struct {
-		OK          bool   `json:"ok"`
-		Error       string `json:"error"`
-		ContentType string `json:"contentType"`
-		Base64      string `json:"base64"`
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
 	}
 	if err := json.Unmarshal(encoded, &result); err != nil {
 		return nil, "", err
@@ -129,8 +153,11 @@ func (b *playwrightMyreadingBrowser) Resource(ctx context.Context, rawURL string
 	if !result.OK {
 		return nil, "", fmt.Errorf("browser fetch: %s", result.Error)
 	}
-	payload, err := base64.StdEncoding.DecodeString(result.Base64)
-	return payload, result.ContentType, err
+	payload, err := response.Body()
+	return payload, response.Headers()["content-type"], err
+}
+func (b *playwrightMyreadingBrowser) SetVisible(visible bool) error {
+	return b.process.SetVisible(visible)
 }
 func (b *playwrightMyreadingBrowser) Cookies(ctx context.Context) ([]browserCookie, error) {
 	select {
@@ -149,6 +176,9 @@ func (b *playwrightMyreadingBrowser) Cookies(ctx context.Context) ([]browserCook
 	return out, nil
 }
 func (b *playwrightMyreadingBrowser) Close() {
+	if b.cdp != nil {
+		_ = b.cdp.Detach()
+	}
 	if b.browser != nil {
 		_ = b.browser.Close()
 	}

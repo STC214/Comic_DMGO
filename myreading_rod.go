@@ -13,7 +13,10 @@ import (
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
+	"github.com/lxn/win"
+	"syscall"
 )
 
 type rodMyreadingBrowser struct {
@@ -81,10 +84,25 @@ func startManualChromium(bin, profile string, headless bool, proxy string) (*man
 	if headless {
 		args = append(args, "--headless=new")
 	} else {
-		// Use the native maximized window and its real content viewport. This is
-		// the same display mode as manually maximizing the standalone browser and
-		// avoids a stale copied-profile window rectangle clipping the challenge.
-		args = append(args, "--start-maximized")
+		// Create the headed browser outside the desktop before its first frame.
+		// Once CDP is ready we hide the native HWND as a second barrier. If a
+		// challenge is found SetVisible(true) restores and maximizes this same real
+		// browser, so the verification viewport remains identical to manual Chrome.
+		width := int(win.GetSystemMetrics(win.SM_CXSCREEN))
+		height := int(win.GetSystemMetrics(win.SM_CYSCREEN))
+		if width < 1280 {
+			width = 1920
+		}
+		if height < 720 {
+			height = 1080
+		}
+		args = append(args,
+			"--window-position=-32000,-32000",
+			fmt.Sprintf("--window-size=%d,%d", width, height),
+			"--disable-background-timer-throttling",
+			"--disable-backgrounding-occluded-windows",
+			"--disable-renderer-backgrounding",
+		)
 	}
 	if strings.TrimSpace(proxy) != "" {
 		args = append(args, "--proxy-server="+strings.TrimSpace(proxy))
@@ -105,7 +123,22 @@ func startManualChromium(bin, profile string, headless bool, proxy string) (*man
 		_ = cmd.Process.Kill()
 		return nil, err
 	}
-	return &manualChromiumProcess{cmd: cmd, exit: exit, port: port, control: control}, nil
+	process := &manualChromiumProcess{cmd: cmd, exit: exit, port: port, control: control}
+	if !headless {
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			if hideErr := process.SetVisible(false); hideErr == nil {
+				log.Printf("myreading Chromium native window hidden before browser attach pid=%d", cmd.Process.Pid)
+				break
+			}
+			if time.Now().After(deadline) {
+				process.Close()
+				return nil, fmt.Errorf("hide Chromium before attach: window for pid %d not found", cmd.Process.Pid)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	return process, nil
 }
 
 func (p *manualChromiumProcess) Close() {
@@ -117,6 +150,56 @@ func (p *manualChromiumProcess) Close() {
 	case <-time.After(2 * time.Second):
 		_ = p.cmd.Process.Kill()
 	}
+}
+
+func (p *manualChromiumProcess) SetVisible(visible bool) error {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return errBrowserClosed
+	}
+	pid := uint32(p.cmd.Process.Pid)
+	found := false
+	callback := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		handle := win.HWND(hwnd)
+		var windowPID uint32
+		win.GetWindowThreadProcessId(handle, &windowPID)
+		if windowPID != pid || win.GetParent(handle) != 0 {
+			return 1
+		}
+		found = true
+		if visible {
+			win.ShowWindow(handle, win.SW_SHOW)
+			win.ShowWindow(handle, win.SW_MAXIMIZE)
+			win.SetForegroundWindow(handle)
+		} else {
+			win.ShowWindow(handle, win.SW_HIDE)
+		}
+		return 1
+	})
+	enumWindowsProc.Call(callback, 0)
+	if !found {
+		return fmt.Errorf("Chromium window for pid %d not found", pid)
+	}
+	return nil
+}
+
+func (p *manualChromiumProcess) WindowVisible() bool {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return false
+	}
+	pid := uint32(p.cmd.Process.Pid)
+	visible := false
+	callback := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		handle := win.HWND(hwnd)
+		var windowPID uint32
+		win.GetWindowThreadProcessId(handle, &windowPID)
+		if windowPID == pid && win.GetParent(handle) == 0 && win.IsWindowVisible(handle) {
+			visible = true
+			return 0
+		}
+		return 1
+	})
+	enumWindowsProc.Call(callback, 0)
+	return visible
 }
 
 func freeLoopbackPort() (int, error) {
@@ -151,7 +234,7 @@ func (b *rodMyreadingBrowser) Snapshot(ctx context.Context, target string) (myre
 	if b.page == nil {
 		return myreadingSnapshot{}, errBrowserClosed
 	}
-	p := b.page.Context(ctx).Timeout(90 * time.Second)
+	p := b.page.Context(ctx).Timeout(180 * time.Second)
 	if err := p.Navigate(target); err != nil {
 		return myreadingSnapshot{}, err
 	}
@@ -178,11 +261,51 @@ func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]by
 	if b.page == nil {
 		return nil, "", errBrowserClosed
 	}
-	payload, err := b.page.Context(ctx).Timeout(90 * time.Second).GetResource(rawURL)
+	p := b.page.Context(ctx).Timeout(180 * time.Second)
+	// Page.getResourceContent only works while Chromium still retains the body.
+	// Reload this exact IMG request immediately before reading it, just like the
+	// original incremental reader-page/network-cache downloader.
+	_ = proto.NetworkSetCacheDisabled{CacheDisabled: true}.Call(p)
+	loaded, err := p.Eval(`async (url) => {
+		const absolute = value => { try { return new URL(value || '', location.href).href; } catch (_) { return ''; } };
+		const attrs = el => ['data-src','data-lazy-src','data-original','src'].map(name => absolute(el.getAttribute(name)));
+		const image = Array.from(document.images).find(el => absolute(el.currentSrc) === url || attrs(el).includes(url));
+		if (!image) return {ok:false, error:'reader image element not found'};
+		image.loading = 'eager'; image.decoding = 'sync';
+		image.scrollIntoView({block:'center', inline:'nearest'});
+		// requestAnimationFrame is deliberately suspended for a hidden native
+		// window. A timer keeps this path operational without exposing the window.
+		await new Promise(resolve => setTimeout(resolve, 50));
+		image.removeAttribute('srcset'); image.removeAttribute('data-srcset'); image.removeAttribute('data-lazy-srcset');
+		image.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+		await new Promise(resolve => setTimeout(resolve, 30));
+		const result = await new Promise(resolve => {
+			const timer = setTimeout(() => resolve({ok:false, error:'reader image load timeout'}), 30000);
+			image.onload = () => { clearTimeout(timer); resolve({ok:image.naturalWidth>1, error:image.naturalWidth>1?'':'empty reader image'}); };
+			image.onerror = () => { clearTimeout(timer); resolve({ok:false, error:'reader image load failed'}); };
+			image.src = url;
+		});
+		return result;
+	}`, rawURL)
+	if err != nil {
+		return nil, "", err
+	}
+	if loaded == nil || !loaded.Value.Get("ok").Bool() {
+		message := "reader image load failed"
+		if loaded != nil {
+			message = loaded.Value.Get("error").Str()
+		}
+		return nil, "", fmt.Errorf("%s", message)
+	}
+	payload, err := p.GetResource(rawURL)
 	if err != nil {
 		return nil, "", err
 	}
 	return payload, "", nil
+}
+
+func (b *rodMyreadingBrowser) SetVisible(visible bool) error {
+	return b.process.SetVisible(visible)
 }
 
 func (b *rodMyreadingBrowser) currentSnapshot(p *rod.Page) (myreadingSnapshot, error) {
