@@ -171,13 +171,20 @@ func (b *playwrightMyreadingBrowser) Resource(ctx context.Context, rawURL string
 		value, evaluateErr = b.page.Evaluate(`async (url) => {
 		const absolute = value => { try { return new URL(value || '', location.href).href; } catch (_) { return ''; } };
 		const attrs = el => ['data-src','data-lazy-src','data-original','src'].map(name => absolute(el.getAttribute(name)));
-		const image = Array.from(document.images).find(el => absolute(el.currentSrc) === url || attrs(el).includes(url));
-		if (!image) return {ok:false, error:'reader image element not found'};
+		let image = Array.from(document.images).find(el => absolute(el.currentSrc) === url || attrs(el).includes(url));
+		let temporary = false;
+		if (!image) {
+			image = document.createElement('img');
+			image.style.cssText='position:fixed;left:-32000px;top:-32000px;width:1px;height:1px;opacity:0;pointer-events:none';
+			(document.body || document.documentElement).appendChild(image);
+			temporary = true;
+		}
 		image.loading='eager'; image.scrollIntoView({block:'center', inline:'nearest'});
 		image.removeAttribute('srcset'); image.removeAttribute('data-srcset'); image.removeAttribute('data-lazy-srcset');
 		image.src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
 		await new Promise(resolve => setTimeout(resolve, 30));
 		const loaded = await new Promise(resolve => { const timer=setTimeout(()=>resolve(false),30000); image.onload=()=>{clearTimeout(timer);resolve(image.naturalWidth>1)}; image.onerror=()=>{clearTimeout(timer);resolve(false)}; image.src=url; });
+		if (temporary) image.remove();
 		return loaded ? {ok:true} : {ok:false, error:'reader image load failed'};
 	}`, rawURL)
 		return evaluateErr

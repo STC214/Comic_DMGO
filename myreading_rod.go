@@ -353,8 +353,14 @@ func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string, trans
 	loaded, err := p.Eval(`async (url) => {
 		const absolute = value => { try { return new URL(value || '', location.href).href; } catch (_) { return ''; } };
 		const attrs = el => ['data-src','data-lazy-src','data-original','src'].map(name => absolute(el.getAttribute(name)));
-		const image = Array.from(document.images).find(el => absolute(el.currentSrc) === url || attrs(el).includes(url));
-		if (!image) return {ok:false, error:'reader image element not found'};
+		let image = Array.from(document.images).find(el => absolute(el.currentSrc) === url || attrs(el).includes(url));
+		let temporary = false;
+		if (!image) {
+			image = document.createElement('img');
+			image.style.cssText = 'position:fixed;left:-32000px;top:-32000px;width:1px;height:1px;opacity:0;pointer-events:none';
+			(document.body || document.documentElement).appendChild(image);
+			temporary = true;
+		}
 		image.loading = 'eager'; image.decoding = 'sync';
 		image.scrollIntoView({block:'center', inline:'nearest'});
 		// requestAnimationFrame is deliberately suspended for a hidden native
@@ -369,6 +375,7 @@ func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string, trans
 			image.onerror = () => { clearTimeout(timer); resolve({ok:false, error:'reader image load failed'}); };
 			image.src = url;
 		});
+		if (temporary) image.remove();
 		return result;
 	}`, rawURL)
 	if err != nil {

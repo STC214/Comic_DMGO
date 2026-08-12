@@ -238,6 +238,28 @@ func TestMyreadingVerificationSnapshotDetection(t *testing.T) {
 	}
 }
 
+func TestMyreadingCollectsOnlyWebPReaderImages(t *testing.T) {
+	accepted := []string{
+		"https://i6.example.test/images/2026/08/11/01.webp",
+		"https://i6.example.test/images/page.WEBP?token=fixture",
+	}
+	for _, raw := range accepted {
+		if !isProbablyMyreadingContentImage(raw) {
+			t.Errorf("WebP reader image rejected: %s", raw)
+		}
+	}
+	for _, raw := range []string{
+		"https://cdn.example.test/tracker.gif",
+		"https://cdn.example.test/banner.jpg",
+		"https://cdn.example.test/logo.png",
+		"https://cdn.example.test/image-without-extension",
+	} {
+		if isProbablyMyreadingContentImage(raw) {
+			t.Errorf("non-WebP resource accepted: %s", raw)
+		}
+	}
+}
+
 func TestFindProjectRootUpwardFromBin(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module fixture\n"), 0o644); err != nil {
@@ -321,7 +343,7 @@ func TestGoMyreadingVerificationToDownloadFlow(t *testing.T) {
 		launches = append(launches, headless)
 		// Both the initial headless browser and the newly opened visible browser
 		// start on the challenge. CurrentSnapshot simulates the user completing it.
-		return &fakeMyreadingBrowser{verification: true, imageURL: srv.URL + "/page.png"}, nil
+		return &fakeMyreadingBrowser{verification: true, imageURL: srv.URL + "/page.webp"}, nil
 	}
 	fakeBin := filepath.Join(t.TempDir(), "chromium.exe")
 	if err := os.WriteFile(fakeBin, []byte("fixture"), 0o644); err != nil {
@@ -343,7 +365,7 @@ func TestGoMyreadingVerificationToDownloadFlow(t *testing.T) {
 	if len(launches) != 1 || launches[0] {
 		t.Fatalf("launch headless sequence=%v", launches)
 	}
-	if _, err := os.Stat(filepath.Join(got.OutputDir, "0001.png")); err != nil {
+	if _, err := os.Stat(filepath.Join(got.OutputDir, "0001.webp")); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -361,19 +383,19 @@ func TestBrowserEnginesCollectReaderFixture(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/reader", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<html><body><main><h1>Fixture Comic</h1><img data-src="/page-1.jpg"><a rel="next" href="/reader-2">next</a></main></body></html>`)
+		fmt.Fprint(w, `<html><body><main><h1>Fixture Comic</h1><img data-src="/page-1.webp"><a rel="next" href="/reader-2">next</a></main></body></html>`)
 	})
 	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>`)
 	})
 	mux.HandleFunc("/reader-2", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<html><body><article><img src="/page-2.png"></article></body></html>`)
+		fmt.Fprint(w, `<html><body><article><img src="/page-2.webp"></article></body></html>`)
 	})
-	mux.HandleFunc("/page-1.jpg", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/page-1.webp", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(testPNGBytes(t))
 	})
-	mux.HandleFunc("/page-2.png", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/page-2.webp", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(testPNGBytes(t))
 	})
@@ -407,6 +429,12 @@ func TestBrowserEnginesCollectReaderFixture(t *testing.T) {
 			}
 			if len(snap2.Images) != 1 {
 				t.Fatalf("snapshot2=%+v", snap2)
+			}
+			// The browser now sits on reader-2, where the first page's IMG is absent.
+			// Resource must still issue that request through the browser context.
+			firstPageResource, _, err := b.Resource(context.Background(), snap.Images[0], nil)
+			if err != nil || len(firstPageResource) == 0 {
+				t.Fatalf("off-page browser resource bytes=%d err=%v", len(firstPageResource), err)
 			}
 			var liveBytes int64
 			resource, _, err := b.Resource(context.Background(), snap2.Images[0], func(delta int64) { liveBytes += delta })

@@ -445,23 +445,13 @@ func (s *downloadSpeedTracker) Average(now time.Time) string {
 }
 
 func isProbablyMyreadingContentImage(rawURL string) bool {
-	lowered := strings.ToLower(strings.TrimSpace(rawURL))
-	for _, marker := range []string{"logo", "icon", "avatar", "sprite", "banner", "advert", "ads", "ad-", "emoji", "blank", "pixel", "200x280"} {
-		if strings.Contains(lowered, marker) {
-			return false
-		}
-	}
-	u, err := url.Parse(lowered)
+	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
 		return false
 	}
-	path := u.Path
-	for _, ext := range []string{".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".svg"} {
-		if strings.HasSuffix(path, ext) {
-			return true
-		}
-	}
-	return strings.Contains(path, "/uploads/") || strings.Contains(path, "/wp-content/") || strings.Contains(path, "/image/") || strings.Contains(path, "/img/")
+	// This reader's comic pages are WebP. Restricting collection here prevents
+	// tracking GIFs, logos and ad resources from shifting page numbering.
+	return strings.EqualFold(filepath.Ext(u.Path), ".webp")
 }
 
 func isMyreadingChallengeTitle(title string) bool {
