@@ -1,4 +1,4 @@
-param(
+﻿param(
   [Parameter(Mandatory = $true)][string]$Version,
   [string]$ChromiumSource = 'F:\Project\01_Comics_Images\comic_downloader\runtime\chromium',
   [string]$PlaywrightDriver = "$env:LOCALAPPDATA\ms-playwright-go\1.61.1"
@@ -26,13 +26,29 @@ $portableDriver = Join-Path $bundle 'runtime\playwright\driver'
 New-Item -ItemType Directory -Force -Path $portableDriver | Out-Null
 Copy-Item -Path (Join-Path $PlaywrightDriver '*') -Destination $portableDriver -Recurse
 Set-Content -LiteralPath (Join-Path $bundle 'workers\.keep') -Value 'Portable-root marker; Go myreading workers are built into Comic_PC.exe.' -Encoding UTF8
-@"
-Comic PC portable $Version
+$portableReadme = @"
+Comic PC 便携版 $Version
 
-Run Comic_PC.exe directly. No Go, Node.js, Python, browser installation, or Playwright setup is required.
-Bundled routes: Rod and Playwright. Bundled browser: runtime\chromium\chrome.exe.
-Writable state, logs, profiles, thumbnails, and downloads remain inside this directory.
-"@ | Set-Content -LiteralPath (Join-Path $bundle 'PORTABLE_README.txt') -Encoding UTF8
+【启动】
+解压完整目录后直接运行 Comic_PC.exe。
+
+【环境】
+不要求安装 Go、Node.js、Python、Playwright、Chrome 或 Edge。
+
+【内置组件】
+- 浏览器：runtime\chromium\chrome.exe
+- Playwright 驱动和 Node.js：runtime\playwright\driver
+- 下载线路：Rod（默认）和 Playwright-Go
+- 配置：config.json，可将 engine 设置为 rod 或 playwright
+
+【运行行为】
+程序最高优先级使用本目录内的 Chromium。普通任务启动时浏览器保持隐藏；检测到验证时才显示窗口，验证完成后重新隐藏并继续下载。
+下载结果默认写入 download，日志、状态、profile 和缩略图保留在本目录内。
+
+【完整性】
+manifest-sha256.json 记录包内文件的大小和 SHA256。
+"@
+$portableReadme | Set-Content -LiteralPath (Join-Path $bundle 'PORTABLE_README.txt') -Encoding UTF8
 $manifest = Get-ChildItem -LiteralPath $bundle -Recurse -File | ForEach-Object {
   [pscustomobject]@{ Path = $_.FullName.Substring($bundle.Length + 1); Size = $_.Length; SHA256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash }
 }

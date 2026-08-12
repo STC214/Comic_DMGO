@@ -188,6 +188,21 @@ func TestPlaywrightDriverReadyRequiresPortableNodeAndCLI(t *testing.T) {
 	}
 }
 
+func TestEnsureChromiumReadyDoesNotReenterReadyCallback(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "chrome.exe")
+	if err := os.WriteFile(bin, []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ui := &fyneUI{chromiumPath: bin}
+	callbackCalls := 0
+	if !ui.ensureChromiumReady(func() { callbackCalls++ }) {
+		t.Fatal("ready Chromium was reported unavailable")
+	}
+	if callbackCalls != 0 {
+		t.Fatalf("ready path re-entered asynchronous callback %d times", callbackCalls)
+	}
+}
+
 func TestSameComicPage(t *testing.T) {
 	base := "https://myreadingmanga.info/work-title/"
 	for _, candidate := range []string{
@@ -467,6 +482,9 @@ func TestRodHeadedRealChromeSmoke(t *testing.T) {
 	if !rodBrowser.process.WindowVisible() {
 		t.Fatal("verification browser did not become visible")
 	}
+	if count := rodBrowser.process.VisibleWindowCount(); count != 1 {
+		t.Fatalf("verification displayed %d Chromium windows, want exactly 1", count)
+	}
 	time.Sleep(time.Second)
 	if rodBrowser.process.cmd.ProcessState != nil && rodBrowser.process.cmd.ProcessState.Exited() {
 		t.Fatal("headed browser exited while waiting for verification")
@@ -479,6 +497,35 @@ func TestRodHeadedRealChromeSmoke(t *testing.T) {
 	probe := filepath.Join(profile, "resource-release.probe")
 	if err := os.WriteFile(probe, []byte("released"), 0o644); err != nil {
 		t.Fatalf("browser profile still locked after close: %v", err)
+	}
+}
+
+func TestDiscardBrowserSessionRestorePreservesAuthentication(t *testing.T) {
+	profile := t.TempDir()
+	keep := filepath.Join(profile, "Default", "Network", "Cookies")
+	remove := []string{
+		filepath.Join(profile, "Default", "Sessions", "Session_123"),
+		filepath.Join(profile, "Default", "Current Session"),
+		filepath.Join(profile, "Profile 1", "Last Tabs"),
+	}
+	for _, path := range append([]string{keep}, remove...) {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("fixture"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := discardBrowserSessionRestore(profile); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("authentication state removed: %v", err)
+	}
+	for _, path := range remove {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("session restore artifact remains: %s err=%v", path, err)
+		}
 	}
 }
 

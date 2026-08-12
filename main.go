@@ -1987,6 +1987,42 @@ func browserProfileSeedSource(worker, browserPath string) string {
 
 var browserProfileOperationMu sync.Mutex
 
+// discardBrowserSessionRestore removes only Chrome's open-window/tab recovery
+// records from a per-task profile. Authentication state (Cookies, Local
+// Storage, IndexedDB, etc.) remains intact, but a retried download cannot
+// restore every verification window left by the preceding run.
+func discardBrowserSessionRestore(profile string) error {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		return nil
+	}
+	return filepath.Walk(profile, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if path == profile || info == nil {
+			return nil
+		}
+		name := strings.ToLower(info.Name())
+		if info.IsDir() && name == "sessions" {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			return filepath.SkipDir
+		}
+		if !info.IsDir() {
+			switch name {
+			case "current session", "current tabs", "last session", "last tabs":
+				return os.Remove(path)
+			}
+		}
+		return nil
+	})
+}
+
 func shouldSkipBrowserProfileEntry(name string, isDir bool) bool {
 	lower := strings.ToLower(strings.TrimSpace(name))
 	if lower == "" {
@@ -2142,6 +2178,9 @@ func ensureTaskBrowserProfile(taskID int, worker, purpose, browserPath, sourceOv
 				preferred = browserProfileSeedSource(worker, browserPath)
 			}
 			if preferred == "" || browserProfileReadyMatches(dest, preferred) {
+				if err := discardBrowserSessionRestore(dest); err != nil {
+					return "", fmt.Errorf("discard browser session restore: %w", err)
+				}
 				return dest, nil
 			}
 		}
@@ -2158,10 +2197,16 @@ func ensureTaskBrowserProfile(taskID int, worker, purpose, browserPath, sourceOv
 		if err := cloneBrowserProfileTreeAtomic("", dest); err != nil {
 			return "", err
 		}
+		if err := discardBrowserSessionRestore(dest); err != nil {
+			return "", fmt.Errorf("discard browser session restore: %w", err)
+		}
 		return dest, nil
 	}
 	if err := cloneBrowserProfileTreeAtomic(source, dest); err != nil {
 		return "", err
+	}
+	if err := discardBrowserSessionRestore(dest); err != nil {
+		return "", fmt.Errorf("discard browser session restore: %w", err)
 	}
 	return dest, nil
 }

@@ -534,6 +534,11 @@ func (ui *fyneUI) buildUI() {
 }
 
 func (ui *fyneUI) makeTopBar() fyne.CanvasObject {
+	title := widget.NewLabelWithStyle(fyneWindowTitle, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	goMark := canvas.NewImageFromResource(goTitleMarkResource())
+	goMark.FillMode = canvas.ImageFillContain
+	goMark.SetMinSize(fyne.NewSize(32, 20))
+	titleWithGoMark := container.NewHBox(title, goMark)
 	buttons := []fyne.CanvasObject{
 		widget.NewButton("\u4e0b\u8f7d\u76ee\u5f55", func() { ui.showDownloadRootDialog() }),
 		widget.NewButton("\u5e76\u53d1\u6570", func() { ui.showConcurrencyDialog() }),
@@ -541,7 +546,9 @@ func (ui *fyneUI) makeTopBar() fyne.CanvasObject {
 		widget.NewButton("\u5bfc\u5165\u5386\u53f2\u8bb0\u5f55", func() { ui.showImportHistoryDialog() }),
 	}
 	tabBar := container.NewHBox(buttons...)
-	return container.NewPadded(tabBar)
+	// This badge belongs to the in-app title row only. The native window and
+	// executable continue to use assets/app.ico through SetIcon above.
+	return container.NewPadded(container.NewBorder(nil, nil, titleWithGoMark, nil, tabBar))
 }
 func (ui *fyneUI) makeStatusBar() fyne.CanvasObject {
 	ui.statusLabel.Wrapping = fyne.TextWrapOff
@@ -2254,6 +2261,7 @@ func (ui *fyneUI) addTaskWithValues(url, downloadRoot string) {
 	if ui == nil || ui.manager == nil {
 		return
 	}
+	log.Printf("ui add task requested url=%s downloadRoot=%s", url, downloadRoot)
 	if !ui.ensureChromiumReady(func() { ui.addTaskWithValues(url, downloadRoot) }) {
 		return
 	}
@@ -2481,9 +2489,10 @@ func (ui *fyneUI) ensureChromiumReady(onReady func()) bool {
 		return true
 	}
 	if ui.chromiumReady() {
-		if onReady != nil {
-			onReady()
-		}
+		// The caller continues synchronously when true is returned. Calling
+		// onReady here recursively re-enters addTaskWithValues until the GUI
+		// process exhausts its stack. onReady is reserved for the asynchronous
+		// setup-dialog path below.
 		return true
 	}
 	ui.showChromiumSetupDialog(onReady)

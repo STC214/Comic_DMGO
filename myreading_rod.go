@@ -28,12 +28,14 @@ type rodMyreadingBrowser struct {
 }
 
 type manualChromiumProcess struct {
-	cmd     *exec.Cmd
-	exit    <-chan error
-	port    int
-	control string
-	profile string
-	close   sync.Once
+	cmd      *exec.Cmd
+	exit     <-chan error
+	port     int
+	control  string
+	profile  string
+	close    sync.Once
+	windowMu sync.Mutex
+	window   win.HWND
 }
 
 func newRodMyreadingBrowser(bin, profile string, headless bool, proxy string) (myreadingBrowser, error) {
@@ -84,6 +86,9 @@ func startManualChromium(bin, profile string, headless bool, proxy string) (*man
 	args := []string{
 		"--remote-debugging-port=" + strconv.Itoa(port),
 		"--user-data-dir=" + profile,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-session-crashed-bubble",
 	}
 	if headless {
 		args = append(args, "--headless=new")
@@ -170,7 +175,45 @@ func (p *manualChromiumProcess) SetVisible(visible bool) error {
 		return errBrowserClosed
 	}
 	pid := uint32(p.cmd.Process.Pid)
-	found := false
+	windows := p.topLevelWindows()
+	if len(windows) == 0 {
+		return fmt.Errorf("Chromium window for pid %d not found", pid)
+	}
+	p.windowMu.Lock()
+	primary := p.window
+	foundPrimary := false
+	for _, handle := range windows {
+		if handle == primary {
+			foundPrimary = true
+			break
+		}
+	}
+	if primary == 0 || !foundPrimary {
+		primary = windows[0]
+		p.window = primary
+	}
+	p.windowMu.Unlock()
+	// Initial hiding covers every restored window. When verification is needed,
+	// keep any unexpected extras hidden and reveal only the recorded primary HWND.
+	for _, handle := range windows {
+		if visible && handle == primary {
+			win.ShowWindow(handle, win.SW_SHOW)
+			win.ShowWindow(handle, win.SW_MAXIMIZE)
+			win.SetForegroundWindow(handle)
+		} else {
+			win.ShowWindow(handle, win.SW_HIDE)
+		}
+	}
+	return nil
+}
+
+func (p *manualChromiumProcess) topLevelWindows() []win.HWND {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return nil
+	}
+	pid := uint32(p.cmd.Process.Pid)
+	var windows []win.HWND
+	var browserWindows []win.HWND
 	callback := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
 		handle := win.HWND(hwnd)
 		var windowPID uint32
@@ -178,41 +221,40 @@ func (p *manualChromiumProcess) SetVisible(visible bool) error {
 		if windowPID != pid || win.GetParent(handle) != 0 {
 			return 1
 		}
-		found = true
-		if visible {
-			win.ShowWindow(handle, win.SW_SHOW)
-			win.ShowWindow(handle, win.SW_MAXIMIZE)
-			win.SetForegroundWindow(handle)
-		} else {
-			win.ShowWindow(handle, win.SW_HIDE)
+		windows = append(windows, handle)
+		className := make([]uint16, 128)
+		if count, _ := win.GetClassName(handle, &className[0], len(className)); count > 0 && syscall.UTF16ToString(className[:count]) == "Chrome_WidgetWin_1" {
+			browserWindows = append(browserWindows, handle)
 		}
 		return 1
 	})
 	enumWindowsProc.Call(callback, 0)
-	if !found {
-		return fmt.Errorf("Chromium window for pid %d not found", pid)
+	if len(browserWindows) > 0 {
+		return browserWindows
 	}
-	return nil
+	return windows
 }
 
 func (p *manualChromiumProcess) WindowVisible() bool {
 	if p == nil || p.cmd == nil || p.cmd.Process == nil {
 		return false
 	}
-	pid := uint32(p.cmd.Process.Pid)
-	visible := false
-	callback := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-		handle := win.HWND(hwnd)
-		var windowPID uint32
-		win.GetWindowThreadProcessId(handle, &windowPID)
-		if windowPID == pid && win.GetParent(handle) == 0 && win.IsWindowVisible(handle) {
-			visible = true
-			return 0
+	for _, handle := range p.topLevelWindows() {
+		if win.IsWindowVisible(handle) {
+			return true
 		}
-		return 1
-	})
-	enumWindowsProc.Call(callback, 0)
-	return visible
+	}
+	return false
+}
+
+func (p *manualChromiumProcess) VisibleWindowCount() int {
+	count := 0
+	for _, handle := range p.topLevelWindows() {
+		if win.IsWindowVisible(handle) {
+			count++
+		}
+	}
+	return count
 }
 
 func freeLoopbackPort() (int, error) {
