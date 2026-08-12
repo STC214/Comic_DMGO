@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -16,13 +18,13 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
 	"github.com/lxn/win"
-	"syscall"
 )
 
 type rodMyreadingBrowser struct {
 	browser *rod.Browser
 	page    *rod.Page
 	process *manualChromiumProcess
+	close   sync.Once
 }
 
 type manualChromiumProcess struct {
@@ -30,6 +32,8 @@ type manualChromiumProcess struct {
 	exit    <-chan error
 	port    int
 	control string
+	profile string
+	close   sync.Once
 }
 
 func newRodMyreadingBrowser(bin, profile string, headless bool, proxy string) (myreadingBrowser, error) {
@@ -123,7 +127,7 @@ func startManualChromium(bin, profile string, headless bool, proxy string) (*man
 		_ = cmd.Process.Kill()
 		return nil, err
 	}
-	process := &manualChromiumProcess{cmd: cmd, exit: exit, port: port, control: control}
+	process := &manualChromiumProcess{cmd: cmd, exit: exit, port: port, control: control, profile: profile}
 	if !headless {
 		deadline := time.Now().Add(3 * time.Second)
 		for {
@@ -142,14 +146,23 @@ func startManualChromium(bin, profile string, headless bool, proxy string) (*man
 }
 
 func (p *manualChromiumProcess) Close() {
-	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+	if p == nil {
 		return
 	}
-	select {
-	case <-p.exit:
-	case <-time.After(2 * time.Second):
-		_ = p.cmd.Process.Kill()
-	}
+	p.close.Do(func() {
+		if p.cmd != nil && p.cmd.Process != nil {
+			select {
+			case <-p.exit:
+			case <-time.After(2 * time.Second):
+				_ = p.cmd.Process.Kill()
+			}
+		}
+		if err := quiesceBrowserProfile(p.profile); err != nil {
+			log.Printf("myreading Chromium process-tree release warning profile=%s err=%v", p.profile, err)
+		} else {
+			log.Printf("myreading Chromium process tree released profile=%s", p.profile)
+		}
+	})
 }
 
 func (p *manualChromiumProcess) SetVisible(visible bool) error {
@@ -257,7 +270,7 @@ func (b *rodMyreadingBrowser) CurrentSnapshot(ctx context.Context) (myreadingSna
 	return b.currentSnapshot(b.page.Context(ctx).Timeout(90 * time.Second))
 }
 
-func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]byte, string, error) {
+func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string, transferred func(int64)) ([]byte, string, error) {
 	if b.page == nil {
 		return nil, "", errBrowserClosed
 	}
@@ -266,6 +279,35 @@ func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]by
 	// Reload this exact IMG request immediately before reading it, just like the
 	// original incremental reader-page/network-cache downloader.
 	_ = proto.NetworkSetCacheDisabled{CacheDisabled: true}.Call(p)
+	var requestID proto.NetworkRequestID
+	eventsDone := make(chan struct{})
+	eventPage, stopEvents := p.WithCancel()
+	waitEvents := eventPage.EachEvent(
+		func(e *proto.NetworkRequestWillBeSent) {
+			if e.Request != nil && e.Request.URL == rawURL {
+				requestID = e.RequestID
+			}
+		},
+		func(e *proto.NetworkDataReceived) {
+			if requestID != "" && e.RequestID == requestID && e.EncodedDataLength > 0 && transferred != nil {
+				transferred(int64(e.EncodedDataLength))
+			}
+		},
+		func(e *proto.NetworkLoadingFinished) bool {
+			return requestID != "" && e.RequestID == requestID
+		},
+		func(e *proto.NetworkLoadingFailed) bool {
+			return requestID != "" && e.RequestID == requestID
+		},
+	)
+	go func() {
+		waitEvents()
+		close(eventsDone)
+	}()
+	defer func() {
+		stopEvents()
+		<-eventsDone
+	}()
 	loaded, err := p.Eval(`async (url) => {
 		const absolute = value => { try { return new URL(value || '', location.href).href; } catch (_) { return ''; } };
 		const attrs = el => ['data-src','data-lazy-src','data-original','src'].map(name => absolute(el.getAttribute(name)));
@@ -289,6 +331,12 @@ func (b *rodMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]by
 	}`, rawURL)
 	if err != nil {
 		return nil, "", err
+	}
+	select {
+	case <-eventsDone:
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	case <-time.After(2 * time.Second):
 	}
 	if loaded == nil || !loaded.Value.Get("ok").Bool() {
 		message := "reader image load failed"
@@ -332,11 +380,18 @@ func (b *rodMyreadingBrowser) Cookies(ctx context.Context) ([]browserCookie, err
 	return out, nil
 }
 func (b *rodMyreadingBrowser) Close() {
-	if b.page != nil {
-		_ = b.page.Close()
+	if b == nil {
+		return
 	}
-	if b.browser != nil {
-		_ = b.browser.Close()
-	}
-	b.process.Close()
+	b.close.Do(func() {
+		if b.page != nil {
+			_ = b.page.Close()
+		}
+		if b.browser != nil {
+			_ = b.browser.Close()
+		}
+		if b.process != nil {
+			b.process.Close()
+		}
+	})
 }

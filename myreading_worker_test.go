@@ -45,7 +45,7 @@ func TestDownloadMyreadingImagesEndToEnd(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	out := t.TempDir()
-	done, bytes, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/one.jpg", srv.URL + "/two.png"}, srv.URL+"/reader", out, nil, 2, func(int, int, int64) {})
+	done, bytes, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/one.jpg", srv.URL + "/two.png"}, srv.URL+"/reader", out, nil, 2, func(int, int, int64, int64) {}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,12 +66,35 @@ func TestDownloadMyreadingImagesRejectsHTML(t *testing.T) {
 	}))
 	defer srv.Close()
 	out := t.TempDir()
-	_, _, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/page.jpg"}, srv.URL, out, nil, 1, func(int, int, int64) {})
+	_, _, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/page.jpg"}, srv.URL, out, nil, 1, func(int, int, int64, int64) {}, nil)
 	if err == nil {
 		t.Fatal("expected HTML response to be rejected")
 	}
 	if matches, _ := filepath.Glob(filepath.Join(out, "0001*")); len(matches) != 0 {
 		t.Fatalf("unexpected output files: %v", matches)
+	}
+}
+
+func TestDownloadResumeDoesNotCountReusedBytesAsNetworkSpeed(t *testing.T) {
+	payload := testPNGBytes(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+	out := t.TempDir()
+	url := srv.URL + "/page.png"
+	if _, _, err := downloadMyreadingImages(context.Background(), nil, []string{url}, srv.URL, out, nil, 1, func(int, int, int64, int64) {}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var transferred int64 = -1
+	if _, _, err := downloadMyreadingImages(context.Background(), nil, []string{url}, srv.URL, out, nil, 1, func(_, _ int, _ int64, networkBytes int64) {
+		transferred = networkBytes
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if transferred != 0 {
+		t.Fatalf("reused file counted as transferred bytes: %d", transferred)
 	}
 }
 
@@ -85,13 +108,83 @@ func TestDownloadMyreadingImagesHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, _, err := downloadMyreadingImages(ctx, nil, []string{srv.URL + "/slow.jpg"}, srv.URL, t.TempDir(), nil, 2, func(int, int, int64) {})
+		_, _, err := downloadMyreadingImages(ctx, nil, []string{srv.URL + "/slow.jpg"}, srv.URL, t.TempDir(), nil, 2, func(int, int, int64, int64) {}, nil)
 		done <- err
 	}()
 	<-started
 	cancel()
 	if err := <-done; err == nil {
 		t.Fatal("expected cancellation error")
+	}
+}
+
+func TestDownloadMyreadingImagesReportsBytesBeforeImageCompletes(t *testing.T) {
+	payload := testPNGBytes(t)
+	firstChunkSent := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		half := len(payload) / 2
+		_, _ = w.Write(payload[:half])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		close(firstChunkSent)
+		<-release
+		_, _ = w.Write(payload[half:])
+	}))
+	defer srv.Close()
+
+	transferSeen := make(chan int64, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/slow.png"}, srv.URL, t.TempDir(), nil, 1,
+			func(int, int, int64, int64) {},
+			func(bytes int64) {
+				select {
+				case transferSeen <- bytes:
+				default:
+				}
+			})
+		done <- err
+	}()
+	<-firstChunkSent
+	select {
+	case bytes := <-transferSeen:
+		if bytes <= 0 {
+			t.Fatalf("reported bytes=%d", bytes)
+		}
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("no transfer update before the image completed")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("download completed before second chunk: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPlaywrightDriverReadyRequiresPortableNodeAndCLI(t *testing.T) {
+	driver := t.TempDir()
+	if playwrightDriverReady(driver) {
+		t.Fatal("empty driver directory reported ready")
+	}
+	if err := os.WriteFile(filepath.Join(driver, "node.exe"), []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(driver, "package"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(driver, "package", "cli.js"), []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !playwrightDriverReady(driver) {
+		t.Fatal("complete portable driver reported unavailable")
 	}
 }
 
@@ -182,7 +275,7 @@ func (b *fakeMyreadingBrowser) CurrentSnapshot(context.Context) (myreadingSnapsh
 	b.verification = false
 	return myreadingSnapshot{Title: "Fixture Verified", Images: []string{b.imageURL}}, nil
 }
-func (b *fakeMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]byte, string, error) {
+func (b *fakeMyreadingBrowser) Resource(ctx context.Context, rawURL string, transferred func(int64)) ([]byte, string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -190,6 +283,9 @@ func (b *fakeMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]b
 	}
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(resp.Body)
+	if err == nil && transferred != nil {
+		transferred(int64(len(payload)))
+	}
 	return payload, resp.Header.Get("Content-Type"), err
 }
 func (b *fakeMyreadingBrowser) Cookies(context.Context) ([]browserCookie, error) { return nil, nil }
@@ -297,16 +393,20 @@ func TestBrowserEnginesCollectReaderFixture(t *testing.T) {
 			if len(snap2.Images) != 1 {
 				t.Fatalf("snapshot2=%+v", snap2)
 			}
-			resource, _, err := b.Resource(context.Background(), snap2.Images[0])
+			var liveBytes int64
+			resource, _, err := b.Resource(context.Background(), snap2.Images[0], func(delta int64) { liveBytes += delta })
 			if err != nil || len(resource) == 0 {
 				t.Fatalf("browser resource bytes=%d err=%v", len(resource), err)
+			}
+			if liveBytes <= 0 {
+				t.Fatal("browser resource did not report live network bytes")
 			}
 			cookies, err := b.Cookies(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
 			out := t.TempDir()
-			done, _, err := downloadMyreadingImages(context.Background(), nil, append(snap.Images, snap2.Images...), srv.URL+"/reader", out, cookies, 1, func(int, int, int64) {})
+			done, _, err := downloadMyreadingImages(context.Background(), nil, append(snap.Images, snap2.Images...), srv.URL+"/reader", out, cookies, 1, func(int, int, int64, int64) {}, nil)
 			if err != nil || done != 2 {
 				t.Fatalf("download done=%d err=%v", done, err)
 			}
@@ -326,7 +426,8 @@ func TestRodHeadedRealChromeSmoke(t *testing.T) {
 		fmt.Fprint(w, `<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>`)
 	}))
 	defer srv.Close()
-	browser, err := newRodMyreadingBrowser(bin, t.TempDir(), false, "")
+	profile := t.TempDir()
+	browser, err := newRodMyreadingBrowser(bin, profile, false, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +470,15 @@ func TestRodHeadedRealChromeSmoke(t *testing.T) {
 	time.Sleep(time.Second)
 	if rodBrowser.process.cmd.ProcessState != nil && rodBrowser.process.cmd.ProcessState.Exited() {
 		t.Fatal("headed browser exited while waiting for verification")
+	}
+	browser.Close()
+	browser.Close() // Close is intentionally idempotent.
+	if rodBrowser.process.cmd.ProcessState == nil || !rodBrowser.process.cmd.ProcessState.Exited() {
+		t.Fatal("Chromium parent process was not reaped")
+	}
+	probe := filepath.Join(profile, "resource-release.probe")
+	if err := os.WriteFile(probe, []byte("released"), 0o644); err != nil {
+		t.Fatalf("browser profile still locked after close: %v", err)
 	}
 }
 
@@ -415,7 +525,7 @@ func TestRealMyreadingFirstBrowserResourceSmoke(t *testing.T) {
 	temp := t.TempDir()
 	var total int64
 	for i, rawURL := range snap.Images[:limit] {
-		payload, contentType, resourceErr := browser.Resource(context.Background(), rawURL)
+		payload, contentType, resourceErr := browser.Resource(context.Background(), rawURL, nil)
 		if resourceErr != nil {
 			t.Fatalf("resource %d/%d: %v", i+1, limit, resourceErr)
 		}

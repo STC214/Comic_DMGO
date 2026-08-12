@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -80,7 +81,7 @@ type browserCookie struct {
 type myreadingBrowser interface {
 	Snapshot(ctx context.Context, target string) (myreadingSnapshot, error)
 	CurrentSnapshot(ctx context.Context) (myreadingSnapshot, error)
-	Resource(ctx context.Context, rawURL string) ([]byte, string, error)
+	Resource(ctx context.Context, rawURL string, transferred func(int64)) ([]byte, string, error)
 	SetVisible(visible bool) error
 	Cookies(ctx context.Context) ([]browserCookie, error)
 	Close()
@@ -177,6 +178,9 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 	log.Printf("myreading real-browser mode id=%d requestedHeadless=%v effectiveHeadless=%v browser=%s", id, task.Headless, browserHeadless, browserPath)
 	browser, err := createMyreadingBrowser(cfg.Engine, browserPath, profile, browserHeadless, cfg.Proxy)
 	if err != nil {
+		if cleanupErr := cleanupTaskBrowserProfiles(id, adapter.name); cleanupErr != nil {
+			log.Printf("myreading failed-start resource cleanup warning id=%d err=%v", id, cleanupErr)
+		}
 		m.setState(id, TaskError, .04, cfg.Engine+" start: "+err.Error())
 		return
 	}
@@ -189,7 +193,14 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 	control := &goMyreadingControl{cancel: cancel, browser: browser}
 	m.registerActiveWorker(id, control)
 	defer m.unregisterActiveWorker(id, control)
-	defer control.Close()
+	defer func() {
+		control.Close()
+		if cleanupErr := cleanupTaskBrowserProfiles(id, adapter.name); cleanupErr != nil {
+			log.Printf("myreading deferred task resource cleanup warning id=%d err=%v", id, cleanupErr)
+		} else {
+			log.Printf("myreading task resources released id=%d profile=%s", id, profile)
+		}
+	}()
 
 	m.setState(id, TaskRunning, .08, "collecting reader pages with "+cfg.Engine)
 	seenPages, seenImages := map[string]bool{}, map[string]bool{}
@@ -321,19 +332,55 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 	}
 	m.setOutputDir(id, out)
 	cookies, _ := browser.Cookies(ctx)
-	var liveBytes int64
-	downloaded, totalBytes, err := downloadMyreadingImages(ctx, browser, images, task.URL, out, cookies, cfg.Retries, func(done, total int, bytes int64) {
-		liveBytes = bytes
+	speed := newDownloadSpeedTracker(time.Now())
+	var liveTransferred atomic.Int64
+	speedStop := make(chan struct{})
+	speedStopped := make(chan struct{})
+	go func() {
+		defer close(speedStopped)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-speedStop:
+				return
+			case now := <-ticker.C:
+				if !m.isStopped(id) {
+					if text := speed.Update(now, liveTransferred.Load()); text != "" {
+						m.setTaskSpeed(id, text)
+					}
+				}
+			}
+		}
+	}()
+	m.setTaskSpeed(id, "实时 计算中")
+	m.setState(id, TaskRunning, .45, fmt.Sprintf("downloading images 0/%d", len(images)))
+	downloaded, totalBytes, err := downloadMyreadingImages(ctx, browser, images, task.URL, out, cookies, cfg.Retries, func(done, total int, bytes, transferred int64) {
 		if m.isStopped(id) {
 			cancel()
 			return
 		}
+		if text := speed.Update(time.Now(), transferred); text != "" {
+			m.setTaskSpeed(id, text)
+		}
 		m.setState(id, TaskRunning, .45+.53*float64(done)/float64(total), fmt.Sprintf("downloading images %d/%d", done, total))
+	}, func(transferred int64) {
+		liveTransferred.Store(transferred)
+		if text := speed.Update(time.Now(), transferred); text != "" {
+			m.setTaskSpeed(id, text)
+		}
 	})
-	_ = liveBytes
+	close(speedStop)
+	<-speedStopped
 	if err != nil {
+		if text := speed.Average(time.Now()); text != "" {
+			m.setTaskSpeed(id, text)
+		}
 		m.setState(id, TaskError, .5, err.Error())
 		return
+	}
+	if text := speed.Average(time.Now()); text != "" {
+		m.setTaskSpeed(id, text)
 	}
 	control.ReleaseBrowser()
 	if releaseErr := quiesceBrowserProfile(profile); releaseErr != nil {
@@ -341,13 +388,60 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 	} else if _, updateErr := updateVerifiedBrowserProfile(adapter.name, profile); updateErr != nil {
 		log.Printf("myreading profile baseline warning id=%d verified=%v err=%v", id, verificationCompleted, updateErr)
 	}
-	if cleanupErr := cleanupTaskBrowserProfiles(id, adapter.name); cleanupErr != nil {
-		log.Printf("myreading task profile cleanup warning id=%d err=%v", id, cleanupErr)
-	}
 	result := map[string]any{"ok": true, "worker": "go-" + cfg.Engine, "title": title, "display_title": title,
 		"output_dir": out, "expected_pages": len(images), "downloaded_pages": downloaded, "bytes": totalBytes}
 	adapter.handleResult(m, id, task, result, out)
 	log.Printf("myreading Go engine complete id=%d engine=%s images=%d bytes=%d output=%s", id, cfg.Engine, downloaded, totalBytes, out)
+}
+
+type downloadSpeedTracker struct {
+	mu        sync.Mutex
+	startedAt time.Time
+	lastAt    time.Time
+	lastBytes int64
+	bytes     int64
+}
+
+func newDownloadSpeedTracker(now time.Time) *downloadSpeedTracker {
+	return &downloadSpeedTracker{startedAt: now, lastAt: now}
+}
+
+func (s *downloadSpeedTracker) Update(now time.Time, totalBytes int64) string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if totalBytes < s.lastBytes {
+		return ""
+	}
+	s.bytes = totalBytes
+	elapsed := now.Sub(s.lastAt).Seconds()
+	delta := totalBytes - s.lastBytes
+	if elapsed < 0.25 {
+		return ""
+	}
+	s.lastAt, s.lastBytes = now, totalBytes
+	if delta == 0 {
+		return "实时 0 B/s"
+	}
+	return formatRealtimeByteRate(float64(delta) / elapsed)
+}
+
+func (s *downloadSpeedTracker) Average(now time.Time) string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bytes <= 0 {
+		return ""
+	}
+	elapsed := now.Sub(s.startedAt).Seconds()
+	if elapsed <= 0 {
+		return ""
+	}
+	return formatAverageByteRate(float64(s.bytes) / elapsed)
 }
 
 func isProbablyMyreadingContentImage(rawURL string) bool {
@@ -438,7 +532,7 @@ func sanitizePathComponent(s string) string {
 	return s
 }
 
-func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, images []string, referer, out string, cookies []browserCookie, retries int, progress func(int, int, int64)) (int, int64, error) {
+func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, images []string, referer, out string, cookies []browserCookie, retries int, progress func(int, int, int64, int64), transferProgress func(int64)) (int, int64, error) {
 	jar, _ := cookiejar.New(nil)
 	byHost := map[string][]*http.Cookie{}
 	for _, c := range cookies {
@@ -459,6 +553,16 @@ func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, imag
 	}
 	client := &http.Client{Jar: jar, Timeout: 90 * time.Second}
 	var totalBytes int64
+	var transferredBytes atomic.Int64
+	reportTransfer := func(delta int64) {
+		if delta <= 0 {
+			return
+		}
+		current := transferredBytes.Add(delta)
+		if transferProgress != nil {
+			transferProgress(current)
+		}
+	}
 	for i, raw := range images {
 		if err := ctx.Err(); err != nil {
 			return i, totalBytes, err
@@ -470,19 +574,26 @@ func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, imag
 		if info, statErr := os.Stat(existing); statErr == nil && info.Mode().IsRegular() {
 			if validationErr := validateDownloadedImage(existing, ""); validationErr == nil {
 				totalBytes += info.Size()
-				progress(i+1, len(images), totalBytes)
+				progress(i+1, len(images), totalBytes, transferredBytes.Load())
 				log.Printf("myreading browser resource reused image=%d/%d bytes=%d", i+1, len(images), info.Size())
 				continue
 			}
 			_ = os.Remove(existing)
 		}
 		if browser != nil {
-			payload, contentType, resourceErr := browser.Resource(ctx, raw)
+			var browserTransferred atomic.Int64
+			payload, contentType, resourceErr := browser.Resource(ctx, raw, func(delta int64) {
+				browserTransferred.Add(delta)
+				reportTransfer(delta)
+			})
 			if resourceErr == nil {
 				n, saveErr := saveMyreadingImageBytes(payload, contentType, raw, out, i)
 				if saveErr == nil {
 					totalBytes += n
-					progress(i+1, len(images), totalBytes)
+					if observed := browserTransferred.Load(); observed < n {
+						reportTransfer(n - observed)
+					}
+					progress(i+1, len(images), totalBytes, transferredBytes.Load())
 					continue
 				}
 				resourceErr = saveErr
@@ -517,7 +628,7 @@ func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, imag
 				resp.Body.Close()
 				return i, totalBytes, ferr
 			}
-			n, cerr := io.Copy(f, resp.Body)
+			n, cerr := io.Copy(&transferCountingWriter{writer: f, report: reportTransfer}, resp.Body)
 			closeErr := f.Close()
 			resp.Body.Close()
 			if cerr == nil {
@@ -544,9 +655,22 @@ func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, imag
 		if last != nil {
 			return i, totalBytes, fmt.Errorf("download image %d/%d: %w", i+1, len(images), last)
 		}
-		progress(i+1, len(images), totalBytes)
+		progress(i+1, len(images), totalBytes, transferredBytes.Load())
 	}
 	return len(images), totalBytes, nil
+}
+
+type transferCountingWriter struct {
+	writer io.Writer
+	report func(int64)
+}
+
+func (w *transferCountingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 && w.report != nil {
+		w.report(int64(n))
+	}
+	return n, err
 }
 
 func saveMyreadingImageBytes(payload []byte, contentType, rawURL, out string, index int) (int64, error) {

@@ -29,6 +29,11 @@ func setChromiumPath(path string) {
 }
 
 func configuredChromiumPath() string {
+	// A portable bundle must remain self-contained even when this development
+	// machine also has the legacy source checkout available.
+	if bundled := bundledChromiumPath(); bundled != "" {
+		return bundled
+	}
 	// Keep the refactored Go worker on the same portable Chromium build as the
 	// proven desktop implementation. This takes precedence over stale UI state
 	// that may still point at Edge.
@@ -42,9 +47,6 @@ func configuredChromiumPath() string {
 		if resolved := resolveChromiumExecutablePath(override); resolved != "" {
 			return resolved
 		}
-	}
-	if bundled := bundledChromiumPath(); bundled != "" {
-		return bundled
 	}
 	return detectSystemChromiumPath()
 }

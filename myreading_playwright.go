@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
 
 	playwright "github.com/mxschmitt/playwright-go"
 )
@@ -15,10 +18,15 @@ type playwrightMyreadingBrowser struct {
 	page    playwright.Page
 	cdp     playwright.CDPSession
 	process *manualChromiumProcess
+	close   sync.Once
 }
 
 func newPlaywrightMyreadingBrowser(bin, profile string, headless bool, proxy string) (myreadingBrowser, error) {
-	pw, err := playwright.Run()
+	runOptions := []*playwright.RunOptions(nil)
+	if driver := resourcePath("runtime", "playwright", "driver"); playwrightDriverReady(driver) {
+		runOptions = append(runOptions, &playwright.RunOptions{DriverDirectory: driver})
+	}
+	pw, err := playwright.Run(runOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("driver missing (run setup-playwright.ps1): %w", err)
 	}
@@ -59,6 +67,15 @@ func newPlaywrightMyreadingBrowser(bin, profile string, headless bool, proxy str
 		return nil, fmt.Errorf("attach page CDP session: %w", err)
 	}
 	return &playwrightMyreadingBrowser{pw: pw, browser: browser, ctx: ctx, page: page, cdp: cdp, process: process}, nil
+}
+
+func playwrightDriverReady(driver string) bool {
+	for _, required := range []string{"node.exe", filepath.Join("package", "cli.js")} {
+		if info, err := os.Stat(filepath.Join(driver, required)); err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
 }
 func (b *playwrightMyreadingBrowser) Snapshot(ctx context.Context, target string) (myreadingSnapshot, error) {
 	select {
@@ -106,7 +123,7 @@ func (b *playwrightMyreadingBrowser) CurrentSnapshot(ctx context.Context) (myrea
 	return snap, nil
 }
 
-func (b *playwrightMyreadingBrowser) Resource(ctx context.Context, rawURL string) ([]byte, string, error) {
+func (b *playwrightMyreadingBrowser) Resource(ctx context.Context, rawURL string, transferred func(int64)) ([]byte, string, error) {
 	select {
 	case <-ctx.Done():
 		return nil, "", ctx.Err()
@@ -116,9 +133,35 @@ func (b *playwrightMyreadingBrowser) Resource(ctx context.Context, rawURL string
 		return nil, "", errBrowserClosed
 	}
 	if b.cdp != nil {
+		if _, err := b.cdp.Send("Network.enable", map[string]any{}); err != nil {
+			return nil, "", err
+		}
 		if _, err := b.cdp.Send("Network.setCacheDisabled", map[string]any{"cacheDisabled": true}); err != nil {
 			return nil, "", err
 		}
+	}
+	var requestID string
+	handler := func(event map[string]any) {
+		method, _ := event["method"].(string)
+		params, _ := event["params"].(map[string]any)
+		switch method {
+		case "Network.requestWillBeSent":
+			request, _ := params["request"].(map[string]any)
+			if requestURL, _ := request["url"].(string); requestURL == rawURL {
+				requestID, _ = params["requestId"].(string)
+			}
+		case "Network.dataReceived":
+			id, _ := params["requestId"].(string)
+			if id == requestID && id != "" && transferred != nil {
+				if n, ok := params["encodedDataLength"].(float64); ok && n > 0 {
+					transferred(int64(n))
+				}
+			}
+		}
+	}
+	if b.cdp != nil {
+		b.cdp.On("event", handler)
+		defer b.cdp.RemoveListener("event", handler)
 	}
 	var value any
 	response, err := b.page.ExpectResponse(func(responseURL string) bool {
@@ -176,14 +219,21 @@ func (b *playwrightMyreadingBrowser) Cookies(ctx context.Context) ([]browserCook
 	return out, nil
 }
 func (b *playwrightMyreadingBrowser) Close() {
-	if b.cdp != nil {
-		_ = b.cdp.Detach()
+	if b == nil {
+		return
 	}
-	if b.browser != nil {
-		_ = b.browser.Close()
-	}
-	if b.pw != nil {
-		_ = b.pw.Stop()
-	}
-	b.process.Close()
+	b.close.Do(func() {
+		if b.cdp != nil {
+			_ = b.cdp.Detach()
+		}
+		if b.browser != nil {
+			_ = b.browser.Close()
+		}
+		if b.pw != nil {
+			_ = b.pw.Stop()
+		}
+		if b.process != nil {
+			b.process.Close()
+		}
+	})
 }
