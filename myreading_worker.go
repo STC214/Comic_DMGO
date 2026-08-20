@@ -516,6 +516,11 @@ func sanitizePathComponent(s string) string {
 	if len([]rune(s)) > 120 {
 		s = string([]rune(s)[:120])
 	}
+	// Truncation can expose a trailing space or dot even when the original
+	// value was already trimmed. Windows removes those characters when it
+	// creates the directory, so retaining them here makes subsequent file
+	// opens address a different path.
+	s = strings.TrimRight(s, ". ")
 	if s == "" {
 		return "untitled"
 	}

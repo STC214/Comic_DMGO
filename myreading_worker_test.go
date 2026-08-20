@@ -18,6 +18,25 @@ import (
 	"time"
 )
 
+func TestSanitizePathComponentTrimsBoundaryExposedByTruncation(t *testing.T) {
+	input := strings.Repeat("a", 119) + " " + "suffix"
+	got := sanitizePathComponent(input)
+	if len([]rune(got)) != 119 {
+		t.Fatalf("sanitized length=%d, want 119: %q", len([]rune(got)), got)
+	}
+	if strings.HasSuffix(got, " ") || strings.HasSuffix(got, ".") {
+		t.Fatalf("sanitized component retains a Windows-invalid suffix: %q", got)
+	}
+}
+
+func TestSanitizePathComponentKeepsValidTruncationBoundary(t *testing.T) {
+	input := strings.Repeat("b", 121)
+	got := sanitizePathComponent(input)
+	if len([]rune(got)) != 120 {
+		t.Fatalf("sanitized length=%d, want 120", len([]rune(got)))
+	}
+}
+
 func testPNGBytes(t *testing.T) []byte {
 	t.Helper()
 	img := image.NewNRGBA(image.Rect(0, 0, 2, 2))
