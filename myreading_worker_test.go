@@ -101,7 +101,10 @@ func TestDownloadResumeDoesNotCountReusedBytesAsNetworkSpeed(t *testing.T) {
 		_, _ = w.Write(payload)
 	}))
 	defer srv.Close()
-	out := t.TempDir()
+	out := filepath.Join(t.TempDir(), "[comic]")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	url := srv.URL + "/page.png"
 	if _, _, err := downloadMyreadingImages(context.Background(), nil, []string{url}, srv.URL, out, nil, 1, func(int, int, int64, int64) {}, nil); err != nil {
 		t.Fatal(err)
@@ -257,25 +260,104 @@ func TestMyreadingVerificationSnapshotDetection(t *testing.T) {
 	}
 }
 
-func TestMyreadingCollectsOnlyWebPReaderImages(t *testing.T) {
+func TestNormalizeImageURLPreservesAllHTTPContentImages(t *testing.T) {
 	accepted := []string{
 		"https://i6.example.test/images/2026/08/11/01.webp",
-		"https://i6.example.test/images/page.WEBP?token=fixture",
+		"https://i6.example.test/images/page.jpg",
+		"https://i6.example.test/images/page.png?token=fixture",
+		"https://i6.example.test/images/image-without-extension",
+		"https://i6.example.test/images/logo-page.avif",
 	}
 	for _, raw := range accepted {
-		if !isProbablyMyreadingContentImage(raw) {
-			t.Errorf("WebP reader image rejected: %s", raw)
+		if got := normalizeImageURL(raw); got != raw {
+			t.Errorf("content image URL changed: got=%q want=%q", got, raw)
 		}
 	}
 	for _, raw := range []string{
-		"https://cdn.example.test/tracker.gif",
-		"https://cdn.example.test/banner.jpg",
-		"https://cdn.example.test/logo.png",
-		"https://cdn.example.test/image-without-extension",
+		"data:image/png;base64,fixture",
+		"javascript:alert(1)",
+		"/relative/page.jpg",
 	} {
-		if isProbablyMyreadingContentImage(raw) {
-			t.Errorf("non-WebP resource accepted: %s", raw)
+		if got := normalizeImageURL(raw); got != "" {
+			t.Errorf("non-HTTP image URL accepted: %s", raw)
 		}
+	}
+}
+
+func TestImageExtensionUsesOnlySupportedImageTypes(t *testing.T) {
+	tests := []struct {
+		url, contentType, want string
+	}{
+		{"https://img.example/page.JPEG", "", ".jpg"},
+		{"https://img.example/page.avifs", "", ".avif"},
+		{"https://img.example/image.php", "image/webp", ".webp"},
+		{"https://img.example/image.ashx?id=1", "image/png; charset=binary", ".png"},
+		{"https://img.example/image", "image/jpeg", ".jpg"},
+		{"https://img.example/image.unknown", "", ".jpg"},
+	}
+	for _, test := range tests {
+		if got := imageExtension(test.url, test.contentType); got != test.want {
+			t.Errorf("imageExtension(%q, %q)=%q want %q", test.url, test.contentType, got, test.want)
+		}
+	}
+}
+
+func TestMisleadingImageURLStillProducesDiscoverableCoverSource(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(testPNGBytes(t))
+	}))
+	defer srv.Close()
+	out := filepath.Join(t.TempDir(), "[comic]")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/image.php"}, srv.URL, out, nil, 1, func(int, int, int64, int64) {}, nil); err != nil {
+		t.Fatal(err)
+	}
+	source := firstImageFileInDir(out)
+	if filepath.Base(source) != "0001.png" {
+		t.Fatalf("cover source=%q want 0001.png", source)
+	}
+	var transferred int64 = -1
+	if _, _, err := downloadMyreadingImages(context.Background(), nil, []string{srv.URL + "/image.php"}, srv.URL, out, nil, 1, func(_, _ int, _ int64, networkBytes int64) {
+		transferred = networkBytes
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || transferred != 0 {
+		t.Fatalf("dynamic-extension resume requests=%d transferred=%d", requests, transferred)
+	}
+	thumb := filepath.Join(t.TempDir(), "cover.jpg")
+	if err := convertImageToThumbnailJPG(source, thumb, 240, 240); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateDownloadedImage(thumb, "image/jpeg"); err != nil {
+		t.Fatalf("thumbnail validation: %v", err)
+	}
+}
+
+func TestMyreadingSnapshotScopesImagesToRequestedContentRoot(t *testing.T) {
+	selectors := []string{
+		"'.entry-content'",
+		"html body.wp-singular.post-template-default.single.single-post.postid-1042843",
+		"/html/body/div[1]/div/div/main/article/div[1]",
+	}
+	for _, selector := range selectors {
+		if !strings.Contains(myreadingDOMSnapshotJS, selector) {
+			t.Errorf("snapshot script missing content selector %q", selector)
+		}
+		if !strings.Contains(myreadingLoadImagesJS, selector) {
+			t.Errorf("lazy-load script missing content selector %q", selector)
+		}
+	}
+	if strings.Contains(myreadingDOMSnapshotJS, "querySelector('article, main") {
+		t.Fatal("snapshot script still permits whole-article ad collection")
+	}
+	if !strings.Contains(myreadingDOMSnapshotJS, "document.querySelector('a[rel=\"next\"]") {
+		t.Fatal("next-page lookup no longer remains document-scoped")
 	}
 }
 
@@ -402,13 +484,19 @@ func TestBrowserEnginesCollectReaderFixture(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/reader", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<html><body><main><h1>Fixture Comic</h1><img data-src="/page-1.webp"><a rel="next" href="/reader-2">next</a></main></body></html>`)
+		fmt.Fprint(w, `<html><body><main><h1>Fixture Comic</h1><img src="/outside-ad.webp"><div class="entry-content"><img data-src="/page-1.webp"></div><a rel="next" href="/reader-2">next</a></main></body></html>`)
 	})
 	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>`)
 	})
 	mux.HandleFunc("/reader-2", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<html><body><article><img src="/page-2.webp"></article></body></html>`)
+		fmt.Fprint(w, `<html><body><article><img src="/outside-ad.webp"><div class="entry-content"><img src="/page-2.webp"></div></article></body></html>`)
+	})
+	mux.HandleFunc("/reader-long", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><body class="wp-singular post-template-default single single-post postid-1042843 single-format-standard wp-theme-genesis wp-child-theme-mrm mrm_guest full-width-content genesis-breadcrumbs-hidden genesis-footer-widgets-visible wpdiscuz_7.6.68"><img src="/outside-ad.webp"><div class="site-container"><div class="site-inner"><div class="content-sidebar-wrap"><main class="content"><article class="post-1042843 post type-post status-publish format-standard has-post-thumbnail category-pokemon-dj lang-jp genre-yaoi artist-mizugi entry"><div class="entry-content"><img src="/long-page.webp"></div></article></main></div></div></div><script>const nativeQuery=document.querySelector.bind(document);document.querySelector=(selector)=>selector==='.entry-content'?null:nativeQuery(selector);</script></body></html>`)
+	})
+	mux.HandleFunc("/reader-xpath", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><body><div><div><div><main><article><div><img src="/xpath-page.webp"></div></article></main></div></div><img src="/outside-ad.webp"></div></body></html>`)
 	})
 	mux.HandleFunc("/page-1.webp", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
@@ -418,6 +506,12 @@ func TestBrowserEnginesCollectReaderFixture(t *testing.T) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(testPNGBytes(t))
 	})
+	for _, path := range []string{"/long-page.webp", "/xpath-page.webp", "/outside-ad.webp"} {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(testPNGBytes(t))
+		})
+	}
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 	factories := map[string]func(string, string, bool, string) (myreadingBrowser, error){"rod": newRodMyreadingBrowser, "playwright": newPlaywrightMyreadingBrowser}
@@ -449,7 +543,21 @@ func TestBrowserEnginesCollectReaderFixture(t *testing.T) {
 			if len(snap2.Images) != 1 {
 				t.Fatalf("snapshot2=%+v", snap2)
 			}
-			// The browser now sits on reader-2, where the first page's IMG is absent.
+			longSnap, err := b.Snapshot(context.Background(), srv.URL+"/reader-long")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(longSnap.Images) != 1 || !strings.HasSuffix(longSnap.Images[0], "/long-page.webp") {
+				t.Fatalf("long-selector snapshot=%+v", longSnap)
+			}
+			xpathSnap, err := b.Snapshot(context.Background(), srv.URL+"/reader-xpath")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(xpathSnap.Images) != 1 || !strings.HasSuffix(xpathSnap.Images[0], "/xpath-page.webp") {
+				t.Fatalf("xpath snapshot=%+v", xpathSnap)
+			}
+			// The browser now sits on reader-xpath, where the first page's IMG is absent.
 			// Resource must still issue that request through the browser context.
 			firstPageResource, _, err := b.Resource(context.Background(), snap.Images[0], nil)
 			if err != nil || len(firstPageResource) == 0 {

@@ -15,7 +15,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,8 +29,17 @@ const myreadingDOMSnapshotJS = `() => {
   const pick = (el) => el.getAttribute('data-src') || el.getAttribute('data-lazy-src') ||
 	  el.getAttribute('data-original') || srcsetURL(el.getAttribute('data-srcset')) ||
 	  srcsetURL(el.getAttribute('data-lazy-srcset')) || el.currentSrc || srcsetURL(el.getAttribute('srcset')) || el.src || '';
-  const root = document.querySelector('article, main, .entry-content, .post-content') || document.body;
-  const images = [...root.querySelectorAll('img')].map(pick).filter(Boolean).map(x => new URL(x, location.href).href);
+  const contentSelectors = [
+    '.entry-content',
+    'html body.wp-singular.post-template-default.single.single-post.postid-1042843.single-format-standard.wp-theme-genesis.wp-child-theme-mrm.mrm\\_guest.full-width-content.genesis-breadcrumbs-hidden.genesis-footer-widgets-visible.wpdiscuz\\_7\\.6\\.68 div.site-container div.site-inner div.content-sidebar-wrap main.content article.post-1042843.post.type-post.status-publish.format-standard.has-post-thumbnail.category-pokemon-dj.lang-jp.genre-yaoi.artist-mizugi.entry div.entry-content'
+  ];
+  let root = null;
+  for (const selector of contentSelectors) {
+    root = document.querySelector(selector);
+    if (root) break;
+  }
+  root = root || document.evaluate('/html/body/div[1]/div/div/main/article/div[1]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+  const images = root ? [...root.querySelectorAll('img')].map(pick).filter(Boolean).map(x => new URL(x, location.href).href) : [];
   const nextEl = document.querySelector('a[rel="next"], a.next, .post-page-numbers.next, .pagination a.next');
   const text = (document.body && document.body.innerText || '').toLowerCase();
   const pageTitle = (document.title || '').trim();
@@ -55,7 +63,17 @@ const myreadingLoadImagesJS = `async () => {
 	let stable = 0, previousHeight = 0, previousCount = 0;
 	for (let step = 0; step < 80 && stable < 3; step++) {
 	  const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-	  const count = document.querySelectorAll('article img, main img, .entry-content img, .post-content img').length;
+	  const contentSelectors = [
+	    '.entry-content',
+	    'html body.wp-singular.post-template-default.single.single-post.postid-1042843.single-format-standard.wp-theme-genesis.wp-child-theme-mrm.mrm\\_guest.full-width-content.genesis-breadcrumbs-hidden.genesis-footer-widgets-visible.wpdiscuz\\_7\\.6\\.68 div.site-container div.site-inner div.content-sidebar-wrap main.content article.post-1042843.post.type-post.status-publish.format-standard.has-post-thumbnail.category-pokemon-dj.lang-jp.genre-yaoi.artist-mizugi.entry div.entry-content'
+	  ];
+	  let root = null;
+	  for (const selector of contentSelectors) {
+	    root = document.querySelector(selector);
+	    if (root) break;
+	  }
+	  root = root || document.evaluate('/html/body/div[1]/div/div/main/article/div[1]', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+	  const count = root ? root.querySelectorAll('img').length : 0;
 	  window.scrollBy(0, Math.max(320, Math.floor(window.innerHeight * 0.75)));
 	  await new Promise(resolve => setTimeout(resolve, 180));
 	  const atBottom = window.scrollY + window.innerHeight >= height - 8;
@@ -298,7 +316,7 @@ func (m *Manager) runGoMyreadingTask(id int, task Task, adapter siteAdapter) {
 			}
 		}
 		for _, raw := range snap.Images {
-			if u := normalizeImageURL(raw); u != "" && isProbablyMyreadingContentImage(u) && !seenImages[u] {
+			if u := normalizeImageURL(raw); u != "" && !seenImages[u] {
 				seenImages[u] = true
 				images = append(images, u)
 			}
@@ -444,16 +462,6 @@ func (s *downloadSpeedTracker) Average(now time.Time) string {
 	return formatAverageByteRate(float64(s.bytes) / elapsed)
 }
 
-func isProbablyMyreadingContentImage(rawURL string) bool {
-	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return false
-	}
-	// This reader's comic pages are WebP. Restricting collection here prevents
-	// tracking GIFs, logos and ad resources from shifting page numbering.
-	return strings.EqualFold(filepath.Ext(u.Path), ".webp")
-}
-
 func isMyreadingChallengeTitle(title string) bool {
 	title = strings.ToLower(strings.TrimSpace(title))
 	return title == "just a moment" || title == "just a moment..." ||
@@ -499,12 +507,6 @@ func normalizeImageURL(raw string) string {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return ""
-	}
-	lower := strings.ToLower(u.Path)
-	for _, marker := range []string{"avatar", "logo", "icon", "emoji", "smilies", "gravatar"} {
-		if strings.Contains(lower, marker) {
-			return ""
-		}
 	}
 	return u.String()
 }
@@ -565,15 +567,36 @@ func downloadMyreadingImages(ctx context.Context, browser myreadingBrowser, imag
 		var last error
 		// Match the established downloader: a complete existing page is reusable,
 		// so a retry resumes at the first missing/corrupt image.
-		existing := filepath.Join(out, fmt.Sprintf("%04d%s", i+1, imageExtension(raw, "")))
-		if info, statErr := os.Stat(existing); statErr == nil && info.Mode().IsRegular() {
+		preferred := filepath.Join(out, fmt.Sprintf("%04d%s", i+1, imageExtension(raw, "")))
+		existingCandidates := []string{preferred}
+		entries, _ := os.ReadDir(out)
+		prefix := fmt.Sprintf("%04d.", i+1)
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) || normalizedImageExtension(filepath.Ext(entry.Name())) == "" {
+				continue
+			}
+			candidate := filepath.Join(out, entry.Name())
+			if candidate != preferred {
+				existingCandidates = append(existingCandidates, candidate)
+			}
+		}
+		reused := false
+		for _, existing := range existingCandidates {
+			info, statErr := os.Stat(existing)
+			if statErr != nil || !info.Mode().IsRegular() {
+				continue
+			}
 			if validationErr := validateDownloadedImage(existing, ""); validationErr == nil {
 				totalBytes += info.Size()
 				progress(i+1, len(images), totalBytes, transferredBytes.Load())
 				log.Printf("myreading browser resource reused image=%d/%d bytes=%d", i+1, len(images), info.Size())
-				continue
+				reused = true
+				break
 			}
 			_ = os.Remove(existing)
+		}
+		if reused {
+			continue
 		}
 		if browser != nil {
 			var browserTransferred atomic.Int64
@@ -715,16 +738,49 @@ func validateDownloadedImage(path, contentType string) error {
 
 func imageExtension(raw, contentType string) string {
 	if u, err := url.Parse(raw); err == nil {
-		e := strings.ToLower(filepath.Ext(u.Path))
-		if len(e) >= 2 && len(e) <= 6 {
-			return e
+		if ext := normalizedImageExtension(filepath.Ext(u.Path)); ext != "" {
+			return ext
 		}
 	}
-	if exts, _ := mime.ExtensionsByType(strings.Split(contentType, ";")[0]); len(exts) > 0 {
-		sort.Strings(exts)
-		return exts[0]
+	mediaType, _, _ := mime.ParseMediaType(strings.TrimSpace(contentType))
+	switch strings.ToLower(mediaType) {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/avif":
+		return ".avif"
+	case "image/bmp", "image/x-ms-bmp":
+		return ".bmp"
+	case "image/tiff":
+		return ".tiff"
 	}
 	return ".jpg"
+}
+
+func normalizedImageExtension(ext string) string {
+	switch strings.ToLower(strings.TrimSpace(ext)) {
+	case ".jpg", ".jpeg", ".jpe", ".jfif":
+		return ".jpg"
+	case ".png":
+		return ".png"
+	case ".gif":
+		return ".gif"
+	case ".webp":
+		return ".webp"
+	case ".avif", ".avifs":
+		return ".avif"
+	case ".bmp", ".dib":
+		return ".bmp"
+	case ".tif", ".tiff":
+		return ".tiff"
+	default:
+		return ""
+	}
 }
 
 func minFloat(a, b float64) float64 {
