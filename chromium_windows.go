@@ -52,7 +52,7 @@ func configuredChromiumPath() string {
 }
 
 func sourceProjectChromiumPath() string {
-	return resolveChromiumExecutablePath(`F:\Project\01_Comics_Images\comic_downloader\runtime\chromium\chrome.exe`)
+	return resolveChromiumExecutablePath(`F:\Project\01_Comics_Images\02_comic_downloader\runtime\chromium\chrome.exe`)
 }
 
 func detectSystemChromiumPath() string {

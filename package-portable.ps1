@@ -1,6 +1,6 @@
 ﻿param(
   [Parameter(Mandatory = $true)][string]$Version,
-  [string]$ChromiumSource = 'F:\Project\01_Comics_Images\comic_downloader\runtime\chromium',
+  [string]$ChromiumSource = 'F:\Project\01_Comics_Images\02_comic_downloader\runtime\chromium',
   [string]$PlaywrightDriver = "$env:LOCALAPPDATA\ms-playwright-go\1.61.1"
 )
 $ErrorActionPreference = 'Stop'

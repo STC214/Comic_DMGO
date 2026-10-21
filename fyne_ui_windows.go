@@ -641,6 +641,25 @@ func taskCardMetaText(task *Task) string {
 
 func compactTaskDetail(detail string) string {
 	detail = cleanVisibleText(detail)
+	// Only completion summaries have a repeated title. Parse their fixed suffix
+	// from the right: titles themselves may contain pipes and field-like text.
+	const summaryPrefix = "done | 完成 | title="
+	if strings.HasPrefix(detail, summaryPrefix) {
+		tail := detail[len(summaryPrefix):]
+		detail = "done | 完成"
+		if output := strings.LastIndex(tail, " | output="); output >= 0 {
+			if pages := strings.LastIndex(tail[:output], " | pages="); pages >= 0 {
+				counts := strings.Split(tail[pages+len(" | pages="):output], "/")
+				if len(counts) == 2 {
+					downloaded, err1 := strconv.Atoi(counts[0])
+					expected, err2 := strconv.Atoi(counts[1])
+					if err1 == nil && err2 == nil && downloaded >= 0 && expected >= 0 {
+						detail += tail[pages:]
+					}
+				}
+			}
+		}
+	}
 	if detail == "" {
 		return ""
 	}

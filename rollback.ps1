@@ -2,7 +2,7 @@ param([switch]$Apply)
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path -LiteralPath $PSScriptRoot).Path
-if ($root -ne 'F:\Project\01_Comics_Images\202608_Comic_PC') {
+if ($root -ne 'F:\Project\01_Comics_Images\01_202608_Comic_PC') {
   throw "Unexpected rollback root: $root"
 }
 
