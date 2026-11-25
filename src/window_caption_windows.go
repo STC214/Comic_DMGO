@@ -32,6 +32,7 @@ var (
 	captionControls        = syscall.NewLazyDLL("comctl32.dll")
 	captionUser            = syscall.NewLazyDLL("user32.dll")
 	captionKernel          = syscall.NewLazyDLL("kernel32.dll")
+	captionGDI             = syscall.NewLazyDLL("gdi32.dll")
 	dwmSetCaptionAttribute = captionDWM.NewProc("DwmSetWindowAttribute")
 	setCaptionSubclass     = captionControls.NewProc("SetWindowSubclass")
 	removeCaptionSubclass  = captionControls.NewProc("RemoveWindowSubclass")
@@ -39,6 +40,8 @@ var (
 	dpiForCaptionWindow    = captionUser.NewProc("GetDpiForWindow")
 	captionMetricsForDPI   = captionUser.NewProc("GetSystemMetricsForDpi")
 	copyCaptionMemory      = captionKernel.NewProc("RtlMoveMemory")
+	captionFillRect        = captionUser.NewProc("FillRect")
+	captionSetBrushColor   = captionGDI.NewProc("SetDCBrushColor")
 	windowCaptionCallback  uintptr
 	// Only accessed by the Fyne/GLFW thread that owns the native window.
 	windowCaptions = make(map[win.HWND]*windowCaptionState)
@@ -200,6 +203,32 @@ func windowCaptionProc(hwnd uintptr, msg uint32, wp, lp, id, _ uintptr) uintptr 
 	}
 
 	switch msg {
+	case win.WM_WINDOWPOSCHANGING:
+		if lp != 0 {
+			var flags uint32
+			address := lp + unsafe.Offsetof(win.WINDOWPOS{}.Flags)
+			copyCaptionMemory.Call(uintptr(unsafe.Pointer(&flags)), address, unsafe.Sizeof(flags))
+			newFlags := captionResizeFlags(flags)
+			if newFlags != flags {
+				copyCaptionMemory.Call(address, uintptr(unsafe.Pointer(&newFlags)), unsafe.Sizeof(newFlags))
+			}
+		}
+	case win.WM_ERASEBKGND:
+		// While the next OpenGL frame is pending, expose only the workspace
+		// background, never the system's light frame or the previous cards.
+		var bounds win.RECT
+		const dcBrush = 18
+		brush := win.GetStockObject(dcBrush)
+		if wp != 0 && brush != 0 && win.GetClientRect(window, &bounds) {
+			const invalidColor = 0xffffffff
+			if previous, _, _ := captionSetBrushColor.Call(wp, 0x00221610); uint32(previous) != invalidColor {
+				painted, _, _ := captionFillRect.Call(wp, uintptr(unsafe.Pointer(&bounds)), uintptr(brush))
+				captionSetBrushColor.Call(wp, previous)
+				if painted != 0 {
+					return 1
+				}
+			}
+		}
 	case win.WM_NCPAINT:
 		// DWM is disabled for the custom caption; don't let the classic
 		// Windows frame paint another title or set of buttons.
@@ -224,49 +253,87 @@ func windowCaptionProc(hwnd uintptr, msg uint32, wp, lp, id, _ uintptr) uintptr 
 }
 
 // The first RECT is the proposed outer rectangle in both forms of NCCALCSIZE.
-// Keep the native sides and bottom and give the app the entire caption area.
-// The caption is tall enough to clear the maximized window's invisible edge.
+// Restored windows have no unpainted native strips. Maximized windows retain
+// the invisible resize insets so the client doesn't extend over the taskbar.
 func calculateWindowCaption(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
+	window := win.HWND(hwnd)
+	if win.IsIconic(window) {
+		return defaultCaptionProc(hwnd, msg, wp, lp)
+	}
+	if !win.IsZoomed(window) {
+		// Use the whole restored window: there is no unpainted nonclient
+		// strip along either side or the bottom.
+		return 0
+	}
 	var top int32
 	topAddress := lp + unsafe.Offsetof(win.RECT{}.Top)
 	copyCaptionMemory.Call(uintptr(unsafe.Pointer(&top)), topAddress, unsafe.Sizeof(top))
 	defaultCaptionProc(hwnd, msg, wp, lp)
+	// Retain the maximized resize insets so the client stays in the work area.
+	top += captionTopFrame(window)
 	copyCaptionMemory.Call(topAddress, uintptr(unsafe.Pointer(&top)), unsafe.Sizeof(top))
 	return 0
 }
 
 func hitTestWindowCaption(hwnd win.HWND, original, lp uintptr) uintptr {
-	if original == win.HTTOPLEFT || original == win.HTTOPRIGHT {
-		return original // Keep diagonal resize handles in the window corners.
-	}
 	point := win.POINT{X: int32(int16(lp)), Y: int32(int16(lp >> 16))}
 	var client win.RECT
 	if !win.ScreenToClient(hwnd, &point) || !win.GetClientRect(hwnd, &client) ||
 		point.X < 0 || point.X >= client.Right {
 		return original
 	}
-	resize := captionTopFrame(hwnd)
-	if win.IsZoomed(hwnd) {
-		resize = 0
+	if point.Y < 0 || point.Y >= client.Bottom {
+		return original
+	}
+	if !win.IsZoomed(hwnd) {
+		if edge := captionResizeEdge(point, client, captionFrameMetric(hwnd, win.SM_CXSIZEFRAME), captionTopFrame(hwnd)); edge != win.HTCLIENT {
+			return edge
+		}
 	}
 	height := windowCaptionHeight(hwnd)
-	if point.Y < 0 || point.Y >= height {
-		return original
+	if point.Y >= height {
+		return win.HTCLIENT
 	}
-	if point.Y >= resize && point.X >= client.Right-windowCaptionPixels(hwnd, captionButtonsWidth) {
+	if point.X >= client.Right-windowCaptionPixels(hwnd, captionButtonsWidth) {
 		return win.HTCLIENT // GLFW/Fyne handle the painted buttons.
 	}
-	return captionHitZone(win.HTCLIENT, point.Y, height, resize)
+	return win.HTCAPTION
 }
 
-func captionHitZone(original uintptr, y, height, resize int32) uintptr {
-	if y < 0 || y >= height {
-		return original
+func captionResizeFlags(flags uint32) uint32 {
+	if flags&win.SWP_NOSIZE == 0 || flags&win.SWP_FRAMECHANGED != 0 {
+		return flags | win.SWP_NOCOPYBITS
 	}
-	if y < resize {
+	return flags
+}
+
+func captionResizeEdge(p win.POINT, bounds win.RECT, horizontal, vertical int32) uintptr {
+	left, right := p.X < horizontal, p.X >= bounds.Right-horizontal
+	if p.Y < vertical {
+		if left {
+			return win.HTTOPLEFT
+		}
+		if right {
+			return win.HTTOPRIGHT
+		}
 		return win.HTTOP
 	}
-	return win.HTCAPTION
+	if p.Y >= bounds.Bottom-vertical {
+		if left {
+			return win.HTBOTTOMLEFT
+		}
+		if right {
+			return win.HTBOTTOMRIGHT
+		}
+		return win.HTBOTTOM
+	}
+	if left {
+		return win.HTLEFT
+	}
+	if right {
+		return win.HTRIGHT
+	}
+	return win.HTCLIENT
 }
 
 func captionPixels(logical, dpi int32) int32 {
@@ -298,13 +365,17 @@ func windowCaptionDPI(hwnd win.HWND) int32 {
 }
 
 func captionTopFrame(hwnd win.HWND) int32 {
+	return captionFrameMetric(hwnd, win.SM_CYSIZEFRAME)
+}
+
+func captionFrameMetric(hwnd win.HWND, metric int32) int32 {
 	if captionMetricsForDPI.Find() == nil {
 		dpi := uintptr(windowCaptionDPI(hwnd))
-		frame, _, _ := captionMetricsForDPI.Call(win.SM_CYSIZEFRAME, dpi)
+		frame, _, _ := captionMetricsForDPI.Call(uintptr(metric), dpi)
 		padding, _, _ := captionMetricsForDPI.Call(captionFramePad, dpi)
 		return int32(frame + padding)
 	}
-	return win.GetSystemMetrics(win.SM_CYSIZEFRAME) + win.GetSystemMetrics(captionFramePad)
+	return win.GetSystemMetrics(metric) + win.GetSystemMetrics(captionFramePad)
 }
 
 func defaultCaptionProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {

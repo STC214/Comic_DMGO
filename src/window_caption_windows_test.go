@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image/png"
 	"math"
@@ -96,25 +97,32 @@ func TestCaptionButtonsArePainted(t *testing.T) {
 }
 
 func TestCaptionHitZones(t *testing.T) {
-	for _, dpi := range []int32{96, 120, 144, 192} {
-		bar := captionPixels(captionHeight, dpi)
-		frame := captionPixels(8, dpi)
-		for _, tc := range []struct {
-			y      int32
-			resize int32
-			want   uintptr
-		}{
-			{-1, frame, win.HTCLIENT},
-			{0, frame, win.HTTOP},
-			{frame - 1, frame, win.HTTOP},
-			{frame, frame, win.HTCAPTION},
-			{bar - 1, frame, win.HTCAPTION},
-			{bar, frame, win.HTCLIENT},
-			{1, 0, win.HTCAPTION},
-		} {
-			if got := captionHitZone(win.HTCLIENT, tc.y, bar, tc.resize); got != tc.want {
-				t.Errorf("dpi=%d y=%d resize=%d: hit=%d, want=%d", dpi, tc.y, tc.resize, got, tc.want)
-			}
+	client := win.RECT{Right: 640, Bottom: 480}
+	for _, tc := range []struct {
+		x, y int32
+		want uintptr
+	}{
+		{0, 0, win.HTTOPLEFT}, {639, 0, win.HTTOPRIGHT},
+		{0, 479, win.HTBOTTOMLEFT}, {639, 479, win.HTBOTTOMRIGHT},
+		{0, 100, win.HTLEFT}, {639, 100, win.HTRIGHT},
+		{100, 0, win.HTTOP}, {100, 479, win.HTBOTTOM},
+		{9, 13, win.HTCLIENT}, {9, 12, win.HTTOP}, {631, 100, win.HTRIGHT},
+	} {
+		if got := captionResizeEdge(win.POINT{X: tc.x, Y: tc.y}, client, 9, 13); got != tc.want {
+			t.Errorf("(%d,%d): hit=%d want=%d", tc.x, tc.y, got, tc.want)
+		}
+	}
+}
+
+func TestCaptionResizeDoesNotPreserveStalePixels(t *testing.T) {
+	for _, tc := range []struct{ input, want uint32 }{
+		{0, win.SWP_NOCOPYBITS},
+		{win.SWP_NOMOVE, win.SWP_NOMOVE | win.SWP_NOCOPYBITS},
+		{win.SWP_NOSIZE, win.SWP_NOSIZE},
+		{win.SWP_NOSIZE | win.SWP_FRAMECHANGED, win.SWP_NOSIZE | win.SWP_FRAMECHANGED | win.SWP_NOCOPYBITS},
+	} {
+		if got := captionResizeFlags(tc.input); got != tc.want {
+			t.Errorf("flags %#x = %#x, want %#x", tc.input, got, tc.want)
 		}
 	}
 }
@@ -156,6 +164,7 @@ func TestCaptionNativeWindow(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	height := int32(math.Ceil(captionHeight * scale))
 	assertNativeCaption(t, hwnd, height, scale)
+	assertRapidCaptionResize(t, hwnd, scale)
 	verifyNativeCaptionCapture(t, root, height, scale, "normal")
 	clickCaptionButton(t, hwnd, 1, height, scale)
 	waitForCaption(t, "maximize by painted button", func() bool { return win.IsZoomed(hwnd) })
@@ -205,6 +214,23 @@ func startCaptionSmoke(t *testing.T, binary string) (windows.ProcessInformation,
 		if err := os.Mkdir(filepath.Join(root, folder), 0755); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// Completed synthetic tasks populate the real task-card list without
+	// loading the user's library or starting downloads.
+	fixture := persistedAppState{Version: persistedAppStateVersion, Concurrency: 1, NextTaskID: 9}
+	for i := 1; i <= 8; i++ {
+		fixture.Tasks = append(fixture.Tasks, &Task{
+			ID: i, URL: fmt.Sprintf("https://example.invalid/resize-fixture/%d", i),
+			Title:  fmt.Sprintf("Resize fixture %d — a long synthetic title", i),
+			Detail: "Completed fixture", Percent: 1, State: TaskDone,
+		})
+	}
+	state, err := json.Marshal(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "runtime", "comic_downloader_state.json"), state, 0600); err != nil {
+		t.Fatal(err)
 	}
 	exe := filepath.Join(root, "Comic_PC.exe")
 	data, err := os.ReadFile(binary)
@@ -429,6 +455,7 @@ func assertNativeCaption(t *testing.T, hwnd win.HWND, height int32, scale float6
 		t.Errorf("drag/body hit codes = %d/%d", drag, body)
 	}
 	if !win.IsZoomed(hwnd) {
+		requireFlushClient(t, hwnd)
 		top := win.SendMessage(hwnd, win.WM_NCHITTEST, 0, captionMessagePoint(x, outer.Top+1))
 		if top != win.HTTOP {
 			t.Errorf("top resize hit code = %d, want %d", top, win.HTTOP)
@@ -444,8 +471,75 @@ func assertNativeCaption(t *testing.T, hwnd win.HWND, height int32, scale float6
 		if leftCorner != win.HTTOPLEFT || rightCorner != win.HTTOPRIGHT {
 			t.Errorf("top corner codes = %d/%d, want %d/%d", leftCorner, rightCorner, win.HTTOPLEFT, win.HTTOPRIGHT)
 		}
+		bottom := win.SendMessage(hwnd, win.WM_NCHITTEST, 0, captionMessagePoint(x, outer.Bottom-2))
+		if bottom != win.HTBOTTOM {
+			t.Errorf("bottom resize hit code = %d, want %d", bottom, win.HTBOTTOM)
+		}
+	} else {
+		monitor := win.MonitorFromWindow(hwnd, 2) // MONITOR_DEFAULTTONEAREST
+		info := win.MONITORINFO{CbSize: uint32(unsafe.Sizeof(win.MONITORINFO{}))}
+		if monitor == 0 || !win.GetMonitorInfo(monitor, &info) {
+			t.Fatal("cannot read maximized window work area")
+		}
+		work := info.RcWork
+		if origin.X < work.Left || origin.Y < work.Top ||
+			origin.X+client.Right > work.Right || origin.Y+client.Bottom > work.Bottom {
+			t.Errorf("maximized client leaves work area: origin=%+v client=%+v work=%+v", origin, client, work)
+		}
 	}
 	t.Logf("dpi=%d zoomed=%v: painted button zones, title drag, body and resize checks", dpi, win.IsZoomed(hwnd))
+}
+
+func requireFlushClient(t *testing.T, hwnd win.HWND) {
+	t.Helper()
+	var outer, client win.RECT
+	var origin win.POINT
+	if !win.GetWindowRect(hwnd, &outer) || !win.GetClientRect(hwnd, &client) || !win.ClientToScreen(hwnd, &origin) {
+		t.Fatal("could not read restored window geometry")
+	}
+	if origin.X != outer.Left || origin.Y != outer.Top || client.Right != outer.Right-outer.Left || client.Bottom != outer.Bottom-outer.Top {
+		t.Fatalf("restored window has an exposed nonclient strip: outer=%+v client=%+v origin=%+v", outer, client, origin)
+	}
+}
+
+func assertRapidCaptionResize(t *testing.T, hwnd win.HWND, scale float64) {
+	t.Helper()
+	var original win.RECT
+	if !win.GetWindowRect(hwnd, &original) {
+		t.Fatal("could not read starting size")
+	}
+	w, h := original.Right-original.Left, original.Bottom-original.Top
+	maxCut := w - int32(math.Ceil(520*scale))
+	if maxCut < 50 {
+		t.Fatalf("starting width %d has insufficient room for the narrow-window test", w)
+	}
+	minWidth := w
+	const flags = win.SWP_NOZORDER | win.SWP_NOACTIVATE
+	for i := 0; i < 36; i++ {
+		// Alternate shrinking from the left and right without waiting for a
+		// paint between calls; also exercise the bottom edge.
+		cut := 20 + (maxCut-20)*int32(i%6)/5
+		x := original.Left
+		if i%2 == 0 {
+			x += cut
+		}
+		if !win.SetWindowPos(hwnd, 0, x, original.Top, w-cut, h-int32(i%6)*20, flags) {
+			t.Fatalf("resize %d failed", i)
+		}
+		requireFlushClient(t, hwnd)
+		var client win.RECT
+		if !win.GetClientRect(hwnd, &client) {
+			t.Fatal("cannot measure narrowed task list")
+		}
+		if client.Right < minWidth {
+			minWidth = client.Right
+		}
+	}
+	if !win.SetWindowPos(hwnd, 0, original.Left, original.Top, w, h, flags) {
+		t.Fatal("failed to restore original bounds")
+	}
+	requireFlushClient(t, hwnd)
+	t.Logf("36 rapid left/right/bottom resizes with synthetic task cards kept the client flush; narrowest width=%d px", minWidth)
 }
 
 func captionMessagePoint(x, y int32) uintptr {
