@@ -53,9 +53,9 @@ type fyneComicTheme struct {
 func (t *fyneComicTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
 	switch name {
 	case theme.ColorNameBackground:
-		return color.NRGBA{R: 18, G: 20, B: 24, A: 255}
+		return color.NRGBA{R: 16, G: 22, B: 34, A: 255}
 	case theme.ColorNameButton:
-		return color.NRGBA{R: 31, G: 34, B: 40, A: 255}
+		return color.NRGBA{R: 37, G: 49, B: 69, A: 255}
 	case theme.ColorNameDisabled:
 		return color.NRGBA{R: 90, G: 94, B: 102, A: 255}
 	case theme.ColorNameDisabledButton:
@@ -75,15 +75,15 @@ func (t *fyneComicTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVaria
 	case theme.ColorNameHeaderBackground:
 		return color.NRGBA{R: 24, G: 27, B: 32, A: 255}
 	case theme.ColorNameInputBackground:
-		return color.NRGBA{R: 23, G: 26, B: 31, A: 255}
+		return color.NRGBA{R: 17, G: 25, B: 39, A: 255}
 	case theme.ColorNameInputBorder:
-		return color.NRGBA{R: 53, G: 58, B: 66, A: 255}
+		return color.NRGBA{R: 104, G: 122, B: 152, A: 255}
 	case theme.ColorNameMenuBackground:
 		return color.NRGBA{R: 23, G: 26, B: 31, A: 255}
 	case theme.ColorNameOverlayBackground:
 		return color.NRGBA{R: 14, G: 16, B: 20, A: 238}
 	case theme.ColorNamePlaceHolder:
-		return color.NRGBA{R: 122, G: 128, B: 138, A: 255}
+		return color.NRGBA{R: 155, G: 173, B: 199, A: 255}
 	case theme.ColorNamePressed:
 		return color.NRGBA{R: 48, G: 55, B: 64, A: 255}
 	case theme.ColorNameScrollBar:
@@ -96,8 +96,10 @@ func (t *fyneComicTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVaria
 		return color.NRGBA{R: 96, G: 140, B: 110, A: 255}
 	case theme.ColorNameWarning:
 		return color.NRGBA{R: 140, G: 122, B: 82, A: 255}
-	case theme.ColorNamePrimary, theme.ColorNameHyperlink:
-		return color.NRGBA{R: 58, G: 79, B: 103, A: 255}
+	case theme.ColorNamePrimary:
+		return color.NRGBA{R: 42, G: 89, B: 176, A: 255}
+	case theme.ColorNameHyperlink:
+		return color.NRGBA{R: 149, G: 192, B: 255, A: 255}
 	case theme.ColorNameForegroundOnPrimary:
 		return color.NRGBA{R: 242, G: 244, B: 246, A: 255}
 	case theme.ColorNameFocus:
@@ -467,10 +469,10 @@ func (ui *fyneUI) buildUI() {
 	ui.concurrencyEntry.OnChanged = func(string) {
 		ui.requestPersist()
 	}
-	ui.addBtn = widget.NewButton("\u6dfb\u52a0\u4efb\u52a1", func() {
+	ui.addBtn = widget.NewButtonWithIcon("\u6dfb\u52a0\u4efb\u52a1", theme.ContentAddIcon(), func() {
 		ui.addTaskFromInput()
 	})
-	ui.addBtn.Importance = widget.MediumImportance
+	ui.addBtn.Importance = widget.HighImportance
 	ui.selectAllBtn = widget.NewButton("\u5168\u9009", func() {
 		ui.selectAllTasks()
 	})
@@ -534,42 +536,53 @@ func (ui *fyneUI) buildUI() {
 }
 
 func (ui *fyneUI) makeTopBar() fyne.CanvasObject {
-	title := widget.NewLabelWithStyle(fyneWindowTitle, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	title := widget.NewRichText(&widget.TextSegment{Text: fyneWindowTitle, Style: widget.RichTextStyleHeading})
 	goMark := canvas.NewImageFromResource(goTitleMarkResource())
 	goMark.FillMode = canvas.ImageFillContain
 	goMark.SetMinSize(fyne.NewSize(32, 20))
 	titleWithGoMark := container.NewHBox(title, goMark)
 	buttons := []fyne.CanvasObject{
-		widget.NewButton("\u4e0b\u8f7d\u76ee\u5f55", func() { ui.showDownloadRootDialog() }),
-		widget.NewButton("\u5e76\u53d1\u6570", func() { ui.showConcurrencyDialog() }),
-		widget.NewButton("\u66f4\u65b0\u5e7f\u544a\u62e6\u622a\u89c4\u5219", func() { ui.updateAdblockRulesFromMenu() }),
-		widget.NewButton("\u5bfc\u5165\u5386\u53f2\u8bb0\u5f55", func() { ui.showImportHistoryDialog() }),
+		widget.NewButtonWithIcon("下载目录", theme.FolderOpenIcon(), func() { ui.showDownloadRootDialog() }),
+		widget.NewButtonWithIcon("并发数", theme.SettingsIcon(), func() { ui.showConcurrencyDialog() }),
+		widget.NewButtonWithIcon("更新广告拦截规则", theme.ViewRefreshIcon(), func() { ui.updateAdblockRulesFromMenu() }),
+		widget.NewButtonWithIcon("导入历史记录", theme.HistoryIcon(), func() { ui.showImportHistoryDialog() }),
 	}
 	tabBar := container.NewHBox(buttons...)
 	// This badge belongs to the in-app title row only. The native window and
 	// executable continue to use assets/app.ico through SetIcon above.
-	return container.NewPadded(container.NewBorder(nil, nil, titleWithGoMark, nil, tabBar))
+	return workspacePanel(container.NewVBox(titleWithGoMark, tabBar))
 }
 func (ui *fyneUI) makeStatusBar() fyne.CanvasObject {
 	ui.statusLabel.Wrapping = fyne.TextWrapOff
+	ui.statusLabel.Truncation = fyne.TextTruncateEllipsis
 	ui.statusLabel.Alignment = fyne.TextAlignLeading
+	ui.statusLabel.TextStyle = fyne.TextStyle{}
 	versionLabel := widget.NewLabel(appVersionLabel())
 	versionLabel.Alignment = fyne.TextAlignTrailing
 	versionLabel.TextStyle = fyne.TextStyle{Monospace: true}
-	return container.NewPadded(container.NewBorder(nil, nil, nil, versionLabel, ui.statusLabel))
+	return workspacePanel(container.NewBorder(nil, nil, widget.NewLabel("状态"), versionLabel, ui.statusLabel))
 }
 
 func (ui *fyneUI) makeBasePage() fyne.CanvasObject {
-	listCard := widget.NewCard("", "", ui.taskList)
 	actionRow := container.NewHBox(ui.selectAllBtn, ui.clearSelectionBtn, ui.pauseBtn, ui.resumeBtn, ui.retryBtn, ui.cancelBtn, ui.deleteBtn)
-	actionCard := widget.NewCard("", "", actionRow)
+	heading := func(text string) *widget.Label {
+		return widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	}
+	input := workspacePanel(container.NewVBox(
+		heading("新建下载任务"),
+		container.NewBorder(nil, nil, nil, ui.addBtn, ui.urlEntry),
+	))
+	listHeader := container.NewBorder(nil, nil, container.NewHBox(widget.NewIcon(theme.ListIcon()), heading("任务列表")), ui.clearBtn)
+	tasks := workspacePanel(container.NewBorder(listHeader, actionRow, nil, nil, ui.taskList))
+	return container.NewBorder(input, nil, nil, nil, tasks)
+}
 
-	topControls := container.NewVBox(
-		container.NewBorder(nil, nil, widget.NewLabelWithStyle("\u7f51\u5740", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), container.NewHBox(ui.addBtn, ui.clearBtn), ui.urlEntry),
-	)
-	upper := container.NewBorder(topControls, actionCard, nil, nil, listCard)
-	upperWrap := container.NewPadded(upper)
-	return upperWrap
+func workspacePanel(content fyne.CanvasObject) fyne.CanvasObject {
+	surface := canvas.NewRectangle(color.NRGBA{R: 25, G: 34, B: 51, A: 255})
+	surface.CornerRadius = 8
+	surface.StrokeColor = color.NRGBA{R: 55, G: 70, B: 95, A: 255}
+	surface.StrokeWidth = 1
+	return container.NewStack(surface, container.NewPadded(content))
 }
 
 func (ui *fyneUI) keyValueRow(key string, value *widget.Label) fyne.CanvasObject {
@@ -807,10 +820,14 @@ func (c *taskCardItem) CreateRenderer() fyne.WidgetRenderer {
 	c.selectedFrame.StrokeWidth = 0
 	c.selectedFrame.StrokeColor = color.NRGBA{R: 111, G: 174, B: 255, A: 255}
 	c.thumbBg = canvas.NewRectangle(color.NRGBA{R: 34, G: 38, B: 45, A: 255})
+	// Hidden images are excluded from the stack's minimum size. Reserve the
+	// same column for cards with and without a cover.
+	coverSize := fyne.NewSize(84, 84)
+	c.thumbBg.SetMinSize(coverSize)
 	c.thumbImage = canvas.NewImageFromImage(image.NewRGBA(image.Rect(0, 0, 1, 1)))
 	c.thumbImage.FillMode = canvas.ImageFillContain
-	c.thumbImage.SetMinSize(fyne.NewSize(84, 84))
-	c.thumbText = canvas.NewText("THUMB", color.NRGBA{R: 190, G: 197, B: 206, A: 255})
+	c.thumbImage.SetMinSize(coverSize)
+	c.thumbText = canvas.NewText("无封面", color.NRGBA{R: 190, G: 197, B: 206, A: 255})
 	c.thumbText.TextStyle = fyne.TextStyle{Bold: true}
 	c.thumbText.Alignment = fyne.TextAlignCenter
 	c.title = widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
@@ -940,7 +957,6 @@ func (c *taskCardItem) refreshContent() {
 		} else {
 			c.thumbText.Color = color.NRGBA{R: 190, G: 197, B: 206, A: 255}
 		}
-		c.thumbText.Text = "THUMB"
 		if c.thumbImage != nil {
 			thumbPath := resolveTaskAssetPath(task.ThumbnailPath)
 			if thumbPath != c.lastThumbnailPath {
