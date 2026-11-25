@@ -82,6 +82,7 @@ func TestWorkspacePreview(t *testing.T) {
 	}
 	ui.buildUI()
 	ui.statusLabel.SetText(strings.Repeat("示例状态：下载任务正在运行 · ", 6))
+	ui.caption.Show() // Render the installed caption; the software driver has no HWND.
 	window := test.NewWindow(ui.root)
 	defer window.Close()
 	for _, sample := range []struct {
