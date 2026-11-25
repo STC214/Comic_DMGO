@@ -1751,8 +1751,10 @@ func projectRootDir() string {
 			return dir
 		}
 	}
-	if wd, err := os.Getwd(); err == nil && looksLikeProjectRoot(wd) {
-		return wd
+	if wd, err := os.Getwd(); err == nil {
+		if root := projectRootAt(wd); root != "" {
+			return root
+		}
 	}
 	if exe, err := os.Executable(); err == nil {
 		if dir := filepath.Dir(exe); dir != "" {
@@ -1771,8 +1773,8 @@ func projectRootDir() string {
 func findProjectRootUpward(start string) string {
 	dir := filepath.Clean(strings.TrimSpace(start))
 	for dir != "" {
-		if looksLikeProjectRoot(dir) {
-			return dir
+		if root := projectRootAt(dir); root != "" {
+			return root
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
@@ -1783,13 +1785,26 @@ func findProjectRootUpward(start string) string {
 	return ""
 }
 
-func looksLikeProjectRoot(dir string) bool {
+const projectSourceDir = "src"
+
+func hasSourceModule(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, projectSourceDir, "go.mod"))
+	return err == nil && info.Mode().IsRegular()
+}
+
+func projectRootAt(dir string) string {
+	if strings.EqualFold(filepath.Base(dir), projectSourceDir) && hasSourceModule(filepath.Dir(dir)) {
+		return filepath.Dir(dir)
+	}
+	if hasSourceModule(dir) {
+		return dir
+	}
 	for _, name := range []string{"go.mod", "workers"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
-			return true
+			return dir
 		}
 	}
-	return false
+	return ""
 }
 
 func looksLikePortableBundle(dir string) bool {
@@ -1843,6 +1858,12 @@ func resourcePath(parts ...string) string {
 		candidate := filepath.Join(base, rel)
 		if _, err := os.Stat(candidate); err == nil {
 			return candidate
+		}
+		if (rel == "config.json" || strings.HasPrefix(rel, "assets"+string(filepath.Separator))) && hasSourceModule(base) {
+			candidate = filepath.Join(base, projectSourceDir, rel)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
 		}
 	}
 	base := projectRootDir()

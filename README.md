@@ -27,7 +27,7 @@ Windows 漫画下载器。目前 `myreadingmanga` 下载链路由 Go 实现，�
 
 ## 配置
 
-`config.json`：
+源码目录的开发默认配置为 `src/config.json`；打包后仍为便携目录中的 `config.json`：
 
 ```json
 {
@@ -54,13 +54,13 @@ Windows 漫画下载器。目前 `myreadingmanga` 下载链路由 Go 实现，�
 ## 构建与测试
 
 ```powershell
-go test ./... -count=1
-go test -race ./... -count=1
-go vet ./...
-.\build.ps1
+go -C src test ./... -count=1
+go -C src test -race ./... -count=1
+go -C src vet ./...
+.\scripts\build.ps1
 ```
 
-`build.ps1` 会先执行测试，再生成 `bin\ComicPC.exe`。版本号采用本地构建时间：
+`scripts/build.ps1` 会先执行测试，再生成 `bin\ComicPC.exe`。版本号采用本地构建时间：
 
 ```text
 yyyyMMddHHmmss
@@ -73,7 +73,7 @@ yyyyMMddHHmmss
 默认 Rod 线路不需要额外安装。Playwright 开发线路首次使用可执行：
 
 ```powershell
-.\setup-playwright.ps1
+.\scripts\setup-playwright.ps1
 ```
 
 然后启动：
@@ -106,26 +106,29 @@ dist\Comic_PC_Portable_20260812105826.zip
 重新制作便携包：
 
 ```powershell
-.\package-portable.ps1 -Version <14位版本号>
+.\scripts\package-portable.ps1 -Version <14位版本号>
 ```
 
-## 主要文件
+## 目录布局
 
-- `main.go`：任务、状态、持久化和通用资源路径。
-- `fyne_ui_windows.go`：Windows/Fyne UI。
-- `myreading_worker.go`：下载全流程、续传、校验与实时速度。
-- `myreading_rod.go`：Rod 浏览器实现。
-- `myreading_playwright.go`：Playwright-Go 浏览器实现。
-- `chromium_windows.go`：Chromium 解析、下载与便携优先级。
-- `build.ps1`：测试、版本注入和构建。
-- `package-portable.ps1`：自包含便携包生成。
-- `artifacts\portable-verification.txt`：便携包验证记录。
+- [`src/`](src/)：Go 主模块、源码、开发默认配置、字体和图标。Go 工具从这里运行；IDE 也可以直接打开此目录。
+- [`scripts/`](scripts/)：构建、便携打包、环境安装和历史回滚脚本。
+- `tests/`、`third_party/`：测试素材和本地依赖。
+- `bin/`、`dist/`、`artifacts/`：开发构建、便携包和验证产物。
+- `runtime/`、`download/`、`logs/`：运行数据、下载和日志，位置不变。
+- [项目工作区规则](src/AGENTS.md)：修改源码和脚本前请阅读。
+
+Windows x64 图标资源随源码检出，不依赖本机遗留文件。替换 `src/assets/app.ico` 后，可从项目根目录用 GNU `windres` 更新资源对象：
+
+```powershell
+windres --target pe-x86-64 -O coff -i scripts/resources/app-icon.rc -o src/app_icon_windows_amd64.syso
+```
 
 ## 文档与历史回滚
 
 - [设计思路](docs/思路.md) 和 [旧项目迁移说明](docs/旧项目说明.md) 位于 `docs/`。
 - [历史回滚脚本及用法](scripts/rollback/README.md) 位于 `scripts/rollback/`。这些脚本只对应特定旧版本，默认仅检查备份；显式加 `-Apply` 才会写入目标。
-- 构建、便携打包和开发环境安装入口仍在项目根目录，原命令不变。
+- 从项目根目录运行上面的命令；不需要进入 `scripts/`。
 
 ## 已验证行为
 
