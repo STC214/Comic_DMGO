@@ -208,10 +208,12 @@ type fyneUI struct {
 	app     fyne.App
 	window  fyne.Window
 
-	root       *fyne.Container
-	pageHolder *fyne.Container
-	pages      map[string]fyne.CanvasObject
-	caption    fyne.CanvasObject
+	root        *fyne.Container
+	pageHolder  *fyne.Container
+	pages       map[string]fyne.CanvasObject
+	caption     fyne.CanvasObject
+	captionMax  *widget.Button
+	captionHWND atomic.Uintptr
 
 	statusLabel       *widget.Label
 	urlEntry          *widget.Entry
@@ -532,7 +534,7 @@ func (ui *fyneUI) buildUI() {
 
 	ui.pageHolder = container.NewMax(ui.pages[fyneTabBase])
 
-	ui.caption = makeWindowCaption()
+	ui.caption = ui.makeWindowCaption()
 	ui.caption.Hide()
 	topBar := container.NewVBox(ui.caption, ui.makeTopBar())
 	statusBar := ui.makeStatusBar()

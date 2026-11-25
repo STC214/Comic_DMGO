@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"image/png"
 	"math"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
@@ -60,6 +62,39 @@ func TestCaptionLayout(t *testing.T) {
 	}
 }
 
+func TestCaptionButtonsArePainted(t *testing.T) {
+	app := test.NewApp()
+	t.Cleanup(app.Quit)
+	app.Settings().SetTheme(&fyneComicTheme{base: theme.DarkTheme()})
+	ui := &fyneUI{pages: make(map[string]fyne.CanvasObject)}
+	ui.buildUI()
+	ui.caption.Show()
+	window := test.NewWindow(ui.root)
+	defer window.Close()
+	for _, width := range []int{520, 1000} {
+		window.Resize(fyne.NewSize(float32(width), 520))
+		for _, icon := range []fyne.Resource{theme.WindowMaximizeIcon(), captionRestoreIcon} {
+			ui.captionMax.SetIcon(icon)
+			frame := window.Canvas().Capture()
+			for i := 0; i < 3; i++ {
+				mid := width - (3-i)*captionButtonWidth + captionButtonWidth/2
+				bright := 0
+				for y := 11; y < 30; y++ {
+					for x := mid - 9; x <= mid+9; x++ {
+						r, g, b, _ := frame.At(x, y).RGBA()
+						if r > 0xa000 && g > 0xa000 && b > 0xa000 {
+							bright++
+						}
+					}
+				}
+				if bright < 8 {
+					t.Errorf("width=%d maximize=%s control=%d: only %d visible glyph pixels", width, icon.Name(), i, bright)
+				}
+			}
+		}
+	}
+}
+
 func TestCaptionHitZones(t *testing.T) {
 	for _, dpi := range []int32{96, 120, 144, 192} {
 		bar := captionPixels(captionHeight, dpi)
@@ -93,9 +128,9 @@ func (c captionTestCanvas) Scale() float32 { return c.scale }
 
 func TestCaptionUsesFyneScale(t *testing.T) {
 	const fakeWindow win.HWND = 1 // no Win32 calls for a valid canvas scale
-	defer delete(windowCaptionCanvases, fakeWindow)
+	defer delete(windowCaptions, fakeWindow)
 	for _, scale := range []float32{0.75, 1, 1.25, 1.5, 2} {
-		windowCaptionCanvases[fakeWindow] = captionTestCanvas{scale: scale}
+		windowCaptions[fakeWindow] = &windowCaptionState{canvas: captionTestCanvas{scale: scale}}
 		if got := windowCaptionHeight(fakeWindow); got != int32(captionHeight*scale) {
 			t.Errorf("scale=%g paints a different caption height: %d", scale, got)
 		}
@@ -120,7 +155,14 @@ func TestCaptionNativeWindow(t *testing.T) {
 	// Cross a paint/layout cycle so the GLFW canvas has applied FYNE_SCALE.
 	time.Sleep(300 * time.Millisecond)
 	height := int32(math.Ceil(captionHeight * scale))
-	assertNativeCaption(t, hwnd, height)
+	assertNativeCaption(t, hwnd, height, scale)
+	verifyNativeCaptionCapture(t, root, height, scale, "normal")
+	clickCaptionButton(t, hwnd, 1, height, scale)
+	waitForCaption(t, "maximize by painted button", func() bool { return win.IsZoomed(hwnd) })
+	assertNativeCaption(t, hwnd, height, scale)
+	verifyNativeCaptionCapture(t, root, height, scale, "maximized")
+	clickCaptionButton(t, hwnd, 1, height, scale)
+	waitForCaption(t, "restore by painted button", func() bool { return !win.IsZoomed(hwnd) })
 	var origin win.POINT
 	if !win.ClientToScreen(hwnd, &origin) {
 		t.Fatal("failed to get client origin")
@@ -128,16 +170,15 @@ func TestCaptionNativeWindow(t *testing.T) {
 	point := captionMessagePoint(origin.X+96, origin.Y+captionPixels(25, windowCaptionDPI(hwnd)))
 	win.PostMessage(hwnd, win.WM_NCLBUTTONDBLCLK, win.HTCAPTION, point)
 	waitForCaption(t, "maximize by caption double click", func() bool { return win.IsZoomed(hwnd) })
-	time.Sleep(300 * time.Millisecond) // wait for DWM to publish new button bounds
-	assertNativeCaption(t, hwnd, height)
-	win.PostMessage(hwnd, win.WM_SYSCOMMAND, win.SC_RESTORE, 0)
-	waitForCaption(t, "restore", func() bool { return !win.IsZoomed(hwnd) })
-	win.PostMessage(hwnd, win.WM_SYSCOMMAND, win.SC_MINIMIZE, 0)
-	waitForCaption(t, "minimize", func() bool { return win.IsIconic(hwnd) })
+	clickCaptionButton(t, hwnd, 1, height, scale)
+	waitForCaption(t, "restore after caption double click", func() bool { return !win.IsZoomed(hwnd) })
+	clickCaptionButton(t, hwnd, 0, height, scale)
+	waitForCaption(t, "minimize by painted button", func() bool { return win.IsIconic(hwnd) })
 	win.PostMessage(hwnd, win.WM_SYSCOMMAND, win.SC_RESTORE, 0)
 	waitForCaption(t, "restore after minimize", func() bool { return !win.IsIconic(hwnd) })
-	closeCaptionSmoke(t, hwnd, app)
-	t.Logf("isolated desktop: scale=%g native caption buttons, maximize, restore, minimize, and graceful close passed", scale)
+	clickCaptionButton(t, hwnd, 2, height, scale)
+	waitForCaptionClose(t, app)
+	t.Logf("isolated desktop: scale=%g painted buttons clicked successfully (maximize, restore, minimize and graceful close)", scale)
 }
 
 func TestCaptionPreviousWindow(t *testing.T) {
@@ -203,6 +244,11 @@ func findCaptionSmokeWindow(t *testing.T, app windows.ProcessInformation, root, 
 func closeCaptionSmoke(t *testing.T, hwnd win.HWND, app windows.ProcessInformation) {
 	t.Helper()
 	win.PostMessage(hwnd, win.WM_SYSCOMMAND, win.SC_CLOSE, 0)
+	waitForCaptionClose(t, app)
+}
+
+func waitForCaptionClose(t *testing.T, app windows.ProcessInformation) {
+	t.Helper()
 	event, err := windows.WaitForSingleObject(app.Process, 15000)
 	if err != nil || event != windows.WAIT_OBJECT_0 {
 		t.Fatalf("window did not close gracefully: event=%d err=%v", event, err)
@@ -272,9 +318,89 @@ func startCaptionTestDesktop(t *testing.T, exe, root string) (windows.ProcessInf
 	return app, cleanup
 }
 
-func assertNativeCaption(t *testing.T, hwnd win.HWND, height int32) {
+func captionButtonPoint(client win.RECT, button int, height int32, scale float64) (int32, int32) {
+	return client.Right - int32(math.Round((2.5-float64(button))*captionButtonWidth*scale)), height / 2
+}
+
+// The optional capture build writes its own GLFW canvas from the isolated
+// desktop. A screenshot of a classic Windows frame is not valid evidence.
+func verifyNativeCaptionCapture(t *testing.T, root string, height int32, scale float64, state string) {
 	t.Helper()
-	var outer, client, buttons win.RECT
+	dir := os.Getenv("COMIC_CAPTION_CAPTURE_DIR")
+	if dir == "" {
+		return
+	}
+	source := filepath.Join(root, "caption-"+state+".png")
+	waitForCaption(t, "GLFW canvas capture: "+state, func() bool {
+		_, err := os.Stat(source)
+		return err == nil
+	})
+	file, err := os.Open(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := png.Decode(file)
+	closeErr := file.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("capture decode=%v close=%v", err, closeErr)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("native-caption-%g-%s.png", scale, state))
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Reject a blank or forwarded native frame even if it happens to contain
+	// three bright button-sized patches. Our painted row also includes the cyan
+	// GO badge beside the title.
+	badge := 0
+	for y := 0; y < int(height); y++ {
+		for x := int(60 * scale); x < int(135*scale); x++ {
+			r, g, b, _ := preview.At(x, y).RGBA()
+			if r < 25700 && g > 30840 && b > 43690 {
+				badge++
+			}
+		}
+	}
+	if badge < 12 {
+		t.Errorf("native capture %s does not show the app-painted GO caption", path)
+	}
+	for i := 0; i < 3; i++ {
+		mid, _ := captionButtonPoint(win.RECT{Right: int32(preview.Bounds().Dx())}, i, height, scale)
+		bright := 0
+		for y := int(height) / 5; y < int(height)*4/5; y++ {
+			for x := int(mid) - int(9*scale); x <= int(mid)+int(9*scale); x++ {
+				r, g, b, _ := preview.At(x, y).RGBA()
+				if r > 41120 && g > 41120 && b > 41120 {
+					bright++
+				}
+			}
+		}
+		if bright < 8 {
+			t.Errorf("native capture %s: control %d has only %d visible glyph pixels", path, i, bright)
+		}
+	}
+	t.Logf("native caption pixels captured in %s", path)
+}
+
+func clickCaptionButton(t *testing.T, hwnd win.HWND, button int, height int32, scale float64) {
+	t.Helper()
+	var client win.RECT
+	if !win.GetClientRect(hwnd, &client) {
+		t.Fatal("failed to get client rectangle")
+	}
+	x, y := captionButtonPoint(client, button, height, scale)
+	point := captionMessagePoint(x, y)
+	win.PostMessage(hwnd, win.WM_MOUSEMOVE, 0, point)
+	win.PostMessage(hwnd, win.WM_LBUTTONDOWN, win.MK_LBUTTON, point)
+	win.PostMessage(hwnd, win.WM_LBUTTONUP, 0, point)
+}
+
+func assertNativeCaption(t *testing.T, hwnd win.HWND, height int32, scale float64) {
+	t.Helper()
+	var outer, client win.RECT
 	if !win.GetWindowRect(hwnd, &outer) || !win.GetClientRect(hwnd, &client) {
 		t.Fatal("failed to get window geometry")
 	}
@@ -283,26 +409,16 @@ func assertNativeCaption(t *testing.T, hwnd win.HWND, height int32) {
 		t.Fatal("failed to get client origin")
 	}
 	getDWMAttribute := captionDWM.NewProc("DwmGetWindowAttribute")
-	const captionButtonBounds = 5
-	hr, _, _ := getDWMAttribute.Call(uintptr(hwnd), captionButtonBounds, uintptr(unsafe.Pointer(&buttons)), unsafe.Sizeof(buttons))
-	if int32(hr) != 0 || buttons.Right <= buttons.Left || buttons.Bottom <= buttons.Top {
-		t.Fatalf("native caption buttons unavailable: HRESULT=%x bounds=%+v", hr, buttons)
+	const ncRenderingEnabled = 1
+	var enabled int32
+	hr, _, _ := getDWMAttribute.Call(uintptr(hwnd), ncRenderingEnabled, uintptr(unsafe.Pointer(&enabled)), unsafe.Sizeof(enabled))
+	if int32(hr) != 0 || enabled != 0 {
+		t.Errorf("system frame painting should be disabled: HRESULT=%x enabled=%d", hr, enabled)
 	}
-	hits := map[uintptr]int{}
-	// A maximized frame's invisible top border is outside the work area.
-	// DWM's buttons are positioned in the visible top band.
-	buttonTop := outer.Top
-	if origin.Y > buttonTop {
-		buttonTop = origin.Y
-	}
-	for y := buttonTop + buttons.Top + 3; y < buttonTop+buttons.Bottom; y += 4 {
-		for x := outer.Left + buttons.Left; x < outer.Left+buttons.Right; x += 5 {
-			hits[win.SendMessage(hwnd, win.WM_NCHITTEST, 0, captionMessagePoint(x, y))]++
-		}
-	}
-	for _, button := range []uintptr{win.HTMINBUTTON, win.HTMAXBUTTON, win.HTCLOSE} {
-		if hits[button] == 0 {
-			t.Errorf("DWM button hit code %d not found; hit counts: %v, bounds=%+v", button, hits, buttons)
+	for i := 0; i < 3; i++ {
+		x, y := captionButtonPoint(client, i, height, scale)
+		if got := win.SendMessage(hwnd, win.WM_NCHITTEST, 0, captionMessagePoint(origin.X+x, origin.Y+y)); got != win.HTCLIENT {
+			t.Errorf("painted control %d not client-clickable: %d", i, got)
 		}
 	}
 	dpi := windowCaptionDPI(hwnd)
@@ -323,8 +439,13 @@ func assertNativeCaption(t *testing.T, hwnd win.HWND, height int32) {
 		if left != win.HTLEFT || right != win.HTRIGHT {
 			t.Errorf("side resize hit codes = %d/%d, want %d/%d", left, right, win.HTLEFT, win.HTRIGHT)
 		}
+		leftCorner := win.SendMessage(hwnd, win.WM_NCHITTEST, 0, captionMessagePoint(outer.Left+1, outer.Top+1))
+		rightCorner := win.SendMessage(hwnd, win.WM_NCHITTEST, 0, captionMessagePoint(outer.Right-2, outer.Top+1))
+		if leftCorner != win.HTTOPLEFT || rightCorner != win.HTTOPRIGHT {
+			t.Errorf("top corner codes = %d/%d, want %d/%d", leftCorner, rightCorner, win.HTTOPLEFT, win.HTTOPRIGHT)
+		}
 	}
-	t.Logf("dpi=%d zoomed=%v window=%+v client=%+v caption buttons=%+v hit counts=%v", dpi, win.IsZoomed(hwnd), outer, client, buttons, hits)
+	t.Logf("dpi=%d zoomed=%v: painted button zones, title drag, body and resize checks", dpi, win.IsZoomed(hwnd))
 }
 
 func captionMessagePoint(x, y int32) uintptr {
