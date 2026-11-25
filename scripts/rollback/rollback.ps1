@@ -1,8 +1,9 @@
 param([switch]$Apply)
 $ErrorActionPreference = 'Stop'
 
-$root = (Resolve-Path -LiteralPath $PSScriptRoot).Path
-if ($root -ne 'F:\Project\01_Comics_Images\01_202608_Comic_PC') {
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
+if (!(Test-Path -LiteralPath (Join-Path $root 'go.mod') -PathType Leaf) -or
+    !(Select-String -LiteralPath (Join-Path $root 'go.mod') -Pattern '^module comic_downloader\s*$' -Quiet)) {
   throw "Unexpected rollback root: $root"
 }
 

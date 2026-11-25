@@ -121,6 +121,12 @@ dist\Comic_PC_Portable_20260812105826.zip
 - `package-portable.ps1`：自包含便携包生成。
 - `artifacts\portable-verification.txt`：便携包验证记录。
 
+## 文档与历史回滚
+
+- [设计思路](docs/思路.md) 和 [旧项目迁移说明](docs/旧项目说明.md) 位于 `docs/`。
+- [历史回滚脚本及用法](scripts/rollback/README.md) 位于 `scripts/rollback/`。这些脚本只对应特定旧版本，默认仅检查备份；显式加 `-Apply` 才会写入目标。
+- 构建、便携打包和开发环境安装入口仍在项目根目录，原命令不变。
+
 ## 已验证行为
 
 - 完整阅读任务下载成功。
