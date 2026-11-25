@@ -6,5 +6,8 @@ $target = Join-Path $root ".gitignore"
 if (!(Test-Path -LiteralPath $backup)) { throw "Missing backup: $backup" }
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $backup).Hash
 if (!$Apply) { Write-Output "VERIFY_ONLY backup_sha256=$hash target_exists=$(Test-Path -LiteralPath $target)"; exit 0 }
+if (Test-Path -LiteralPath (Join-Path $root 'src\go.mod') -PathType Leaf) {
+  throw 'This rollback needs a checkout with the former root layout.'
+}
 Copy-Item -LiteralPath $backup -Destination $target -Force
 Write-Output "ROLLBACK_OK restored=$target sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash)"

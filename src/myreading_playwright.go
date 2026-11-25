@@ -28,7 +28,7 @@ func newPlaywrightMyreadingBrowser(bin, profile string, headless bool, proxy str
 	}
 	pw, err := playwright.Run(runOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("driver missing (run setup-playwright.ps1): %w", err)
+		return nil, fmt.Errorf("driver missing (run scripts/setup-playwright.ps1): %w", err)
 	}
 	process, err := startManualChromium(bin, profile, headless, proxy)
 	if err != nil {

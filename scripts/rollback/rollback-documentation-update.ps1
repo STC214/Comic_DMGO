@@ -19,6 +19,9 @@ if (!$Apply) {
   Write-Output "VERIFY_ONLY documentation_originals=$($required.Count) old_zip_sha256=$((Get-FileHash -LiteralPath $oldZip -Algorithm SHA256).Hash)"
   exit 0
 }
+if (Test-Path -LiteralPath (Join-Path $root 'src\go.mod') -PathType Leaf) {
+  throw 'This rollback needs a checkout with the former root layout.'
+}
 $docs = Join-Path $root 'docs'
 foreach ($path in @($docs, $bundle)) {
   if (!(Test-Path -LiteralPath $path -PathType Container)) { throw "Missing rollback destination: $path" }

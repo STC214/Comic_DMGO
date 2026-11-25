@@ -2,8 +2,10 @@ param([switch]$Apply)
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-if (!(Test-Path -LiteralPath (Join-Path $root 'go.mod') -PathType Leaf) -or
-    !(Select-String -LiteralPath (Join-Path $root 'go.mod') -Pattern '^module comic_downloader\s*$' -Quiet)) {
+$module = Join-Path $root 'src\go.mod'
+if (!(Test-Path -LiteralPath $module -PathType Leaf)) { $module = Join-Path $root 'go.mod' }
+if (!(Test-Path -LiteralPath $module -PathType Leaf) -or
+    !(Select-String -LiteralPath $module -Pattern '^module comic_downloader\s*$' -Quiet)) {
   throw "Unexpected rollback root: $root"
 }
 

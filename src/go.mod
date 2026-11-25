@@ -58,6 +58,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace golang.org/x/tools => ./third_party/golang.org_x_tools
+replace golang.org/x/tools => ../third_party/golang.org_x_tools
 
-replace golang.org/x/exp/shiny => ./third_party/golang.org_x_exp_shiny
+replace golang.org/x/exp/shiny => ../third_party/golang.org_x_exp_shiny
