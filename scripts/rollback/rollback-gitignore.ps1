@@ -1,6 +1,6 @@
 ﻿param([switch]$Apply)
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $backup = Join-Path $root "artifacts\original\.gitignore.pre-ignore-config"
 $target = Join-Path $root ".gitignore"
 if (!(Test-Path -LiteralPath $backup)) { throw "Missing backup: $backup" }

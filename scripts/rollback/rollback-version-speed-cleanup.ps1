@@ -1,6 +1,6 @@
 ﻿param([switch]$Apply)
 $ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $previous = Join-Path $root "artifacts\original\ComicPC.pre-version-speed-cleanup.exe"
 $current = Join-Path $root "bin\ComicPC.exe"
 if (!(Test-Path -LiteralPath $previous)) { throw "Missing previous artifact: $previous" }

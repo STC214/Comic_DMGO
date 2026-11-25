@@ -1,6 +1,6 @@
 param([switch]$Apply)
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+$root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $target = 'D:\tools\03_Shota_tools\crawler_NH\20260812_Go_myreading'
 $original = Join-Path $root 'artifacts\original\portable-add-task-fix'
 $oldExe = Join-Path $original 'Comic_PC.portable-before-add-task-fix.exe'
