@@ -211,6 +211,7 @@ type fyneUI struct {
 	root       *fyne.Container
 	pageHolder *fyne.Container
 	pages      map[string]fyne.CanvasObject
+	caption    fyne.CanvasObject
 
 	statusLabel       *widget.Label
 	urlEntry          *widget.Entry
@@ -306,6 +307,7 @@ func runNativeUI(manager *Manager, persisted *persistedAppState) error {
 	defer ui.stopAutoPersistLoop()
 	setAppRefreshHook(ui.requestRefresh)
 	ui.window.Show()
+	go ui.installWindowCaption()
 	ui.windowReady.Store(true)
 	ui.startAutoPersistLoop()
 	ui.requestRefresh()
@@ -530,27 +532,21 @@ func (ui *fyneUI) buildUI() {
 
 	ui.pageHolder = container.NewMax(ui.pages[fyneTabBase])
 
-	topBar := ui.makeTopBar()
+	ui.caption = makeWindowCaption()
+	ui.caption.Hide()
+	topBar := container.NewVBox(ui.caption, ui.makeTopBar())
 	statusBar := ui.makeStatusBar()
 	ui.root = container.NewBorder(topBar, statusBar, nil, nil, container.NewPadded(ui.pageHolder))
 }
 
 func (ui *fyneUI) makeTopBar() fyne.CanvasObject {
-	title := widget.NewRichText(&widget.TextSegment{Text: fyneWindowTitle, Style: widget.RichTextStyleHeading})
-	goMark := canvas.NewImageFromResource(goTitleMarkResource())
-	goMark.FillMode = canvas.ImageFillContain
-	goMark.SetMinSize(fyne.NewSize(32, 20))
-	titleWithGoMark := container.NewHBox(title, goMark)
 	buttons := []fyne.CanvasObject{
 		widget.NewButtonWithIcon("下载目录", theme.FolderOpenIcon(), func() { ui.showDownloadRootDialog() }),
 		widget.NewButtonWithIcon("并发数", theme.SettingsIcon(), func() { ui.showConcurrencyDialog() }),
 		widget.NewButtonWithIcon("更新广告拦截规则", theme.ViewRefreshIcon(), func() { ui.updateAdblockRulesFromMenu() }),
 		widget.NewButtonWithIcon("导入历史记录", theme.HistoryIcon(), func() { ui.showImportHistoryDialog() }),
 	}
-	tabBar := container.NewHBox(buttons...)
-	// This badge belongs to the in-app title row only. The native window and
-	// executable continue to use assets/app.ico through SetIcon above.
-	return workspacePanel(container.NewVBox(titleWithGoMark, tabBar))
+	return workspacePanel(container.NewHBox(buttons...))
 }
 func (ui *fyneUI) makeStatusBar() fyne.CanvasObject {
 	ui.statusLabel.Wrapping = fyne.TextWrapOff
