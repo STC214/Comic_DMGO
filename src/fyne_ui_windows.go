@@ -308,8 +308,13 @@ func runNativeUI(manager *Manager, persisted *persistedAppState) error {
 	ui := newFyneUI(manager, persisted)
 	defer ui.stopAutoPersistLoop()
 	setAppRefreshHook(ui.requestRefresh)
+	// Use the loaded placement, not the mutable state that auto-save updates.
+	var startupPlacement persistedWindowPlacement
+	if persisted != nil {
+		startupPlacement = persisted.UI.Window
+	}
 	ui.window.Show()
-	go ui.installWindowCaption()
+	go ui.installWindowCaption(startupPlacement)
 	ui.windowReady.Store(true)
 	ui.startAutoPersistLoop()
 	ui.requestRefresh()
@@ -1743,13 +1748,6 @@ func (ui *fyneUI) applyPersistedUIState() {
 		return
 	}
 	state := ui.persistedState
-	if state.UI.Window.Valid {
-		width := state.UI.Window.NormalPosition.Right - state.UI.Window.NormalPosition.Left
-		height := state.UI.Window.NormalPosition.Bottom - state.UI.Window.NormalPosition.Top
-		if width > 0 && height > 0 {
-			ui.window.Resize(fyne.NewSize(float32(width), float32(height)))
-		}
-	}
 	if draft := strings.TrimSpace(state.UI.URLDraft); draft != "" {
 		ui.urlEntry.SetText(draft)
 	}

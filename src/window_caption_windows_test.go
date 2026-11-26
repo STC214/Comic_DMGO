@@ -115,15 +115,37 @@ func TestCaptionHitZones(t *testing.T) {
 }
 
 func TestCaptionResizeDoesNotPreserveStalePixels(t *testing.T) {
-	for _, tc := range []struct{ input, want uint32 }{
-		{0, win.SWP_NOCOPYBITS},
-		{win.SWP_NOMOVE, win.SWP_NOMOVE | win.SWP_NOCOPYBITS},
-		{win.SWP_NOSIZE, win.SWP_NOSIZE},
-		{win.SWP_NOSIZE | win.SWP_FRAMECHANGED, win.SWP_NOSIZE | win.SWP_FRAMECHANGED | win.SWP_NOCOPYBITS},
+	for _, tc := range []struct {
+		flags   uint32
+		resized bool
+		want    uint32
+	}{
+		{0, true, win.SWP_NOCOPYBITS},
+		{0, false, 0}, // moving with unchanged dimensions but no SWP_NOSIZE
+		{win.SWP_NOMOVE, true, win.SWP_NOMOVE | win.SWP_NOCOPYBITS},
+		{win.SWP_NOSIZE, true, win.SWP_NOSIZE},
+		{win.SWP_NOSIZE | win.SWP_FRAMECHANGED, false, win.SWP_NOSIZE | win.SWP_FRAMECHANGED | win.SWP_NOCOPYBITS},
 	} {
-		if got := captionResizeFlags(tc.input); got != tc.want {
-			t.Errorf("flags %#x = %#x, want %#x", tc.input, got, tc.want)
+		if got := captionResizeFlags(tc.flags, tc.resized); got != tc.want {
+			t.Errorf("flags %#x resized=%v = %#x, want %#x", tc.flags, tc.resized, got, tc.want)
 		}
+	}
+}
+
+func TestCaptionStartupFitsWorkArea(t *testing.T) {
+	work := win.RECT{Left: -1600, Top: 48, Right: 0, Bottom: 900}
+	oversized := win.RECT{Left: -2400, Top: -290, Right: 300, Bottom: 1200}
+	if got := fitStartupRect(oversized, work, persistedWindowPlacement{}); got != work {
+		t.Errorf("oversized bounds = %+v, want %+v", got, work)
+	}
+	saved := persistedWindowPlacement{Valid: true, NormalPosition: persistedRect{Left: -400, Top: -100, Right: 500, Bottom: 640}}
+	want := win.RECT{Left: -1250, Top: 104, Right: -350, Bottom: 844}
+	if got := fitStartupRect(oversized, work, saved); got != want {
+		t.Errorf("saved physical dimensions = %+v, want %+v", got, want)
+	}
+	visible := win.RECT{Left: -1300, Top: 100, Right: -650, Bottom: 740}
+	if got := fitStartupRect(visible, work, persistedWindowPlacement{}); got != visible {
+		t.Errorf("already-visible bounds moved: %+v", got)
 	}
 }
 
@@ -163,7 +185,9 @@ func TestCaptionNativeWindow(t *testing.T) {
 	// Cross a paint/layout cycle so the GLFW canvas has applied FYNE_SCALE.
 	time.Sleep(300 * time.Millisecond)
 	height := int32(math.Ceil(captionHeight * scale))
+	assertStartupWorkArea(t, hwnd)
 	assertNativeCaption(t, hwnd, height, scale)
+	assertRapidCaptionMove(t, hwnd)
 	assertRapidCaptionResize(t, hwnd, scale)
 	verifyNativeCaptionCapture(t, root, height, scale, "normal")
 	clickCaptionButton(t, hwnd, 1, height, scale)
@@ -190,6 +214,40 @@ func TestCaptionNativeWindow(t *testing.T) {
 	t.Logf("isolated desktop: scale=%g painted buttons clicked successfully (maximize, restore, minimize and graceful close)", scale)
 }
 
+func TestCaptionNativeOversizedSavedWindow(t *testing.T) {
+	binary := os.Getenv("COMIC_CAPTION_SMOKE_EXE")
+	if binary == "" {
+		t.Skip("set COMIC_CAPTION_SMOKE_EXE to exercise the Windows release")
+	}
+	t.Setenv("FYNE_SCALE", "2")
+	saved := persistedWindowPlacement{
+		Valid: true, NormalPosition: persistedRect{Left: -900, Top: -500, Right: 2600, Bottom: 1700},
+	}
+	app, root, finish := startCaptionSmokeWithPlacement(t, binary, saved)
+	defer finish()
+	hwnd := findCaptionSmokeWindow(t, app, root, "native window caption enabled")
+	assertStartupWorkArea(t, hwnd)
+	// Fyne can queue a second resize when the custom caption becomes visible.
+	// Check that it has not moved the window back outside the work area.
+	time.Sleep(300 * time.Millisecond)
+	assertStartupWorkArea(t, hwnd)
+	closeCaptionSmoke(t, hwnd, app)
+}
+
+func assertStartupWorkArea(t *testing.T, hwnd win.HWND) {
+	t.Helper()
+	var bounds win.RECT
+	info := win.MONITORINFO{CbSize: uint32(unsafe.Sizeof(win.MONITORINFO{}))}
+	if !win.GetWindowRect(hwnd, &bounds) || !win.GetMonitorInfo(win.MonitorFromWindow(hwnd, 2), &info) {
+		t.Fatal("cannot read restored window's work area")
+	}
+	work := info.RcWork
+	if bounds.Left < work.Left || bounds.Top < work.Top || bounds.Right > work.Right || bounds.Bottom > work.Bottom {
+		t.Fatalf("startup window is outside monitor work area: bounds=%+v work=%+v", bounds, work)
+	}
+	t.Logf("startup bounds=%+v fit within work area=%+v", bounds, work)
+}
+
 func TestCaptionPreviousWindow(t *testing.T) {
 	binary := os.Getenv("COMIC_CAPTION_BASELINE_EXE")
 	if binary == "" {
@@ -209,6 +267,11 @@ func TestCaptionPreviousWindow(t *testing.T) {
 
 func startCaptionSmoke(t *testing.T, binary string) (windows.ProcessInformation, string, func()) {
 	t.Helper()
+	return startCaptionSmokeWithPlacement(t, binary, persistedWindowPlacement{})
+}
+
+func startCaptionSmokeWithPlacement(t *testing.T, binary string, placement persistedWindowPlacement) (windows.ProcessInformation, string, func()) {
+	t.Helper()
 	root := t.TempDir()
 	for _, folder := range []string{"runtime", "workers"} {
 		if err := os.Mkdir(filepath.Join(root, folder), 0755); err != nil {
@@ -217,7 +280,7 @@ func startCaptionSmoke(t *testing.T, binary string) (windows.ProcessInformation,
 	}
 	// Completed synthetic tasks populate the real task-card list without
 	// loading the user's library or starting downloads.
-	fixture := persistedAppState{Version: persistedAppStateVersion, Concurrency: 1, NextTaskID: 9}
+	fixture := persistedAppState{Version: persistedAppStateVersion, Concurrency: 1, NextTaskID: 9, UI: persistedUIState{Window: placement}}
 	for i := 1; i <= 8; i++ {
 		fixture.Tasks = append(fixture.Tasks, &Task{
 			ID: i, URL: fmt.Sprintf("https://example.invalid/resize-fixture/%d", i),
@@ -252,7 +315,9 @@ func findCaptionSmokeWindow(t *testing.T, app windows.ProcessInformation, root, 
 		var windowPID uint32
 		window := win.HWND(candidate)
 		win.GetWindowThreadProcessId(window, &windowPID)
-		if pid == windowPID && win.GetParent(window) == 0 && win.IsWindowVisible(window) {
+		var bounds win.RECT
+		if pid == windowPID && win.GetParent(window) == 0 && win.IsWindowVisible(window) &&
+			win.GetWindowRect(window, &bounds) && validWindowRect(bounds) {
 			hwnd = window
 			return 0
 		}
@@ -295,9 +360,10 @@ func startCaptionTestDesktop(t *testing.T, exe, root string) (windows.ProcessInf
 	closeDesktop := captionUser.NewProc("CloseDesktop")
 	getThreadDesktop := captionUser.NewProc("GetThreadDesktop")
 	setThreadDesktop := captionUser.NewProc("SetThreadDesktop")
+	setThreadDPI := captionUser.NewProc("SetThreadDpiAwarenessContext")
 	old, _, _ := getThreadDesktop.Call(uintptr(windows.GetCurrentThreadId()))
 	var app windows.ProcessInformation
-	var desk uintptr
+	var desk, oldDPI uintptr
 	cleanup := func() {
 		if app.Process != 0 {
 			state, _ := windows.WaitForSingleObject(app.Process, 0)
@@ -311,6 +377,9 @@ func startCaptionTestDesktop(t *testing.T, exe, root string) (windows.ProcessInf
 		if desk != 0 {
 			setThreadDesktop.Call(old)
 			closeDesktop.Call(desk)
+		}
+		if oldDPI != 0 {
+			setThreadDPI.Call(oldDPI)
 		}
 		runtime.UnlockOSThread()
 	}
@@ -333,6 +402,15 @@ func startCaptionTestDesktop(t *testing.T, exe, root string) (windows.ProcessInf
 	}
 	if ok, _, err := setThreadDesktop.Call(desk); ok == 0 {
 		t.Fatalf("failed to bind only the test thread to its desktop: %v", err)
+	}
+	// Compare HWND and client bounds in physical pixels. At 125% Windows can
+	// otherwise round the virtualized window and client rectangles separately.
+	if setThreadDPI.Find() == nil {
+		const perMonitorAwareV2 = ^uintptr(3) // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 (-4)
+		oldDPI, _, err = setThreadDPI.Call(perMonitorAwareV2)
+		if oldDPI == 0 {
+			t.Fatalf("failed to use physical coordinates on the test thread: %v", err)
+		}
 	}
 	startup := windows.StartupInfo{Desktop: namePtr}
 	startup.Cb = uint32(unsafe.Sizeof(startup))
@@ -500,6 +578,30 @@ func requireFlushClient(t *testing.T, hwnd win.HWND) {
 	if origin.X != outer.Left || origin.Y != outer.Top || client.Right != outer.Right-outer.Left || client.Bottom != outer.Bottom-outer.Top {
 		t.Fatalf("restored window has an exposed nonclient strip: outer=%+v client=%+v origin=%+v", outer, client, origin)
 	}
+}
+
+func assertRapidCaptionMove(t *testing.T, hwnd win.HWND) {
+	t.Helper()
+	var initial win.RECT
+	if !win.GetWindowRect(hwnd, &initial) {
+		t.Fatal("cannot read window before moving")
+	}
+	width, height := initial.Right-initial.Left, initial.Bottom-initial.Top
+	const flags = win.SWP_NOACTIVATE | win.SWP_NOZORDER
+	for i := int32(1); i <= 24; i++ {
+		// Supplying the same size without SWP_NOSIZE also occurs in practice.
+		if !win.SetWindowPos(hwnd, 0, initial.Left+i, initial.Top+i/2, width, height, flags) {
+			t.Fatalf("move %d failed", i)
+		}
+		var bounds win.RECT
+		if !win.GetWindowRect(hwnd, &bounds) || bounds.Right-bounds.Left != width || bounds.Bottom-bounds.Top != height {
+			t.Fatalf("move %d changed the window's dimensions: %+v", i, bounds)
+		}
+	}
+	if !win.SetWindowPos(hwnd, 0, initial.Left, initial.Top, 0, 0, flags|win.SWP_NOSIZE) {
+		t.Fatal("failed to restore position after moves")
+	}
+	t.Log("24 rapid position-only moves preserved the window dimensions")
 }
 
 func assertRapidCaptionResize(t *testing.T, hwnd win.HWND, scale float64) {

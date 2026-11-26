@@ -32,7 +32,6 @@ var (
 	captionControls        = syscall.NewLazyDLL("comctl32.dll")
 	captionUser            = syscall.NewLazyDLL("user32.dll")
 	captionKernel          = syscall.NewLazyDLL("kernel32.dll")
-	captionGDI             = syscall.NewLazyDLL("gdi32.dll")
 	dwmSetCaptionAttribute = captionDWM.NewProc("DwmSetWindowAttribute")
 	setCaptionSubclass     = captionControls.NewProc("SetWindowSubclass")
 	removeCaptionSubclass  = captionControls.NewProc("RemoveWindowSubclass")
@@ -40,17 +39,16 @@ var (
 	dpiForCaptionWindow    = captionUser.NewProc("GetDpiForWindow")
 	captionMetricsForDPI   = captionUser.NewProc("GetSystemMetricsForDpi")
 	copyCaptionMemory      = captionKernel.NewProc("RtlMoveMemory")
-	captionFillRect        = captionUser.NewProc("FillRect")
-	captionSetBrushColor   = captionGDI.NewProc("SetDCBrushColor")
 	windowCaptionCallback  uintptr
 	// Only accessed by the Fyne/GLFW thread that owns the native window.
 	windowCaptions = make(map[win.HWND]*windowCaptionState)
 )
 
 type windowCaptionState struct {
-	canvas    fyne.Canvas
-	ui        *fyneUI
-	maximized bool
+	canvas       fyne.Canvas
+	ui           *fyneUI
+	maximized    bool
+	startupUntil time.Time
 }
 
 var captionRestoreIcon = theme.NewThemedResource(fyne.NewStaticResource("windowRestore.svg", []byte(
@@ -106,7 +104,7 @@ func (ui *fyneUI) postCaptionCommand(command uintptr) {
 	win.PostMessage(hwnd, win.WM_SYSCOMMAND, command, 0)
 }
 
-func (ui *fyneUI) installWindowCaption() {
+func (ui *fyneUI) installWindowCaption(startupPlacement persistedWindowPlacement) {
 	native, ok := ui.window.(driver.NativeWindow)
 	if !ok {
 		return
@@ -121,11 +119,18 @@ func (ui *fyneUI) installWindowCaption() {
 			}
 			ready = true
 			hwnd := win.HWND(ctx.HWND)
+			if !win.IsWindowVisible(hwnd) {
+				ready = false
+				return
+			}
 			if attachWindowCaption(hwnd, ui) {
 				ui.captionHWND.Store(uintptr(hwnd))
 				ui.caption.Show()
 				ui.root.Refresh()
+				fitStartupWindow(hwnd, startupPlacement)
 				log.Printf("native window caption enabled scale=%g", ui.window.Canvas().Scale())
+			} else {
+				fitStartupWindow(hwnd, startupPlacement)
 			}
 		})
 		if ready {
@@ -133,6 +138,62 @@ func (ui *fyneUI) installWindowCaption() {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+}
+
+func fitStartupWindow(hwnd win.HWND, saved persistedWindowPlacement) {
+	var outer win.RECT
+	if !win.GetWindowRect(hwnd, &outer) || win.IsZoomed(hwnd) || win.IsIconic(hwnd) {
+		return
+	}
+	work, ok := captionMonitorWorkArea(hwnd)
+	if !ok {
+		return
+	}
+	fitted := fitStartupRect(outer, work, saved)
+	if fitted == outer {
+		return
+	}
+	flags := uint32(win.SWP_NOZORDER | win.SWP_NOACTIVATE)
+	if fitted.Right-fitted.Left == outer.Right-outer.Left && fitted.Bottom-fitted.Top == outer.Bottom-outer.Top {
+		flags |= win.SWP_NOSIZE
+	}
+	if win.SetWindowPos(hwnd, 0, fitted.Left, fitted.Top, fitted.Right-fitted.Left, fitted.Bottom-fitted.Top, flags) {
+		log.Printf("startup window fitted to work area: old=%+v target=%+v", outer, fitted)
+	}
+}
+
+func captionMonitorWorkArea(hwnd win.HWND) (win.RECT, bool) {
+	monitor := win.MonitorFromWindow(hwnd, 2) // MONITOR_DEFAULTTONEAREST
+	info := win.MONITORINFO{CbSize: uint32(unsafe.Sizeof(win.MONITORINFO{}))}
+	ok := monitor != 0 && win.GetMonitorInfo(monitor, &info) &&
+		info.RcWork.Right > info.RcWork.Left && info.RcWork.Bottom > info.RcWork.Top
+	return info.RcWork, ok
+}
+
+func fitStartupRect(outer, work win.RECT, saved persistedWindowPlacement) win.RECT {
+	availableW, availableH := work.Right-work.Left, work.Bottom-work.Top
+	width, height := outer.Right-outer.Left, outer.Bottom-outer.Top
+	if availableW <= 0 || availableH <= 0 || width <= 0 || height <= 0 {
+		return outer
+	}
+	left, top := outer.Left, outer.Top
+	if saved.Valid && validPersistedRect(saved.NormalPosition) {
+		// Saved bounds are already physical Windows pixels. Do not feed them
+		// into Fyne.Resize, which would multiply them by UI scale again.
+		width = saved.NormalPosition.Right - saved.NormalPosition.Left
+		height = saved.NormalPosition.Bottom - saved.NormalPosition.Top
+		width, height = min(width, availableW), min(height, availableH)
+		left, top = work.Left+(availableW-width)/2, work.Top+(availableH-height)/2
+	}
+	width, height = min(width, availableW), min(height, availableH)
+	if left < work.Left {
+		left = work.Left
+	}
+	if top < work.Top {
+		top = work.Top
+	}
+	left, top = min(left, work.Right-width), min(top, work.Bottom-height)
+	return win.RECT{Left: left, Top: top, Right: left + width, Bottom: top + height}
 }
 
 func attachWindowCaption(hwnd win.HWND, ui *fyneUI) bool {
@@ -143,7 +204,9 @@ func attachWindowCaption(hwnd win.HWND, ui *fyneUI) bool {
 			return false
 		}
 	}
-	state := &windowCaptionState{canvas: ui.window.Canvas(), ui: ui}
+	// Showing the caption can queue another GLFW size adjustment after the
+	// first fit. Keep those startup adjustments inside the work area too.
+	state := &windowCaptionState{canvas: ui.window.Canvas(), ui: ui, startupUntil: time.Now().Add(time.Second)}
 	windowCaptions[hwnd] = state
 	attached := false
 	defer func() {
@@ -203,32 +266,52 @@ func windowCaptionProc(hwnd uintptr, msg uint32, wp, lp, id, _ uintptr) uintptr 
 	}
 
 	switch msg {
-	case win.WM_WINDOWPOSCHANGING:
-		if lp != 0 {
-			var flags uint32
-			address := lp + unsafe.Offsetof(win.WINDOWPOS{}.Flags)
-			copyCaptionMemory.Call(uintptr(unsafe.Pointer(&flags)), address, unsafe.Sizeof(flags))
-			newFlags := captionResizeFlags(flags)
-			if newFlags != flags {
-				copyCaptionMemory.Call(address, uintptr(unsafe.Pointer(&newFlags)), unsafe.Sizeof(newFlags))
-			}
+	case win.WM_ENTERSIZEMOVE:
+		if state := windowCaptions[window]; state != nil {
+			state.startupUntil = time.Time{}
 		}
-	case win.WM_ERASEBKGND:
-		// While the next OpenGL frame is pending, expose only the workspace
-		// background, never the system's light frame or the previous cards.
-		var bounds win.RECT
-		const dcBrush = 18
-		brush := win.GetStockObject(dcBrush)
-		if wp != 0 && brush != 0 && win.GetClientRect(window, &bounds) {
-			const invalidColor = 0xffffffff
-			if previous, _, _ := captionSetBrushColor.Call(wp, 0x00221610); uint32(previous) != invalidColor {
-				painted, _, _ := captionFillRect.Call(wp, uintptr(unsafe.Pointer(&bounds)), uintptr(brush))
-				captionSetBrushColor.Call(wp, previous)
-				if painted != 0 {
-					return 1
+	case win.WM_WINDOWPOSCHANGING:
+		result := defaultCaptionProc(hwnd, msg, wp, lp)
+		if lp != 0 {
+			var pos win.WINDOWPOS
+			copyCaptionMemory.Call(uintptr(unsafe.Pointer(&pos)), lp, unsafe.Sizeof(pos))
+			before := pos
+			var current win.RECT
+			haveCurrent := win.GetWindowRect(window, &current)
+			if pos.Flags&win.SWP_NOSIZE == 0 && haveCurrent &&
+				(pos.Cx != current.Right-current.Left || pos.Cy != current.Bottom-current.Top) &&
+				!win.IsZoomed(window) && !win.IsIconic(window) {
+				// Do this after GLFW/Win32 validate the proposed geometry:
+				// their native style calculations still add the caption and
+				// resize margins, even though our restored window has none.
+				if work, ok := captionMonitorWorkArea(window); ok {
+					pos.Cx = min(pos.Cx, work.Right-work.Left)
+					pos.Cy = min(pos.Cy, work.Bottom-work.Top)
+					if state := windowCaptions[window]; state != nil && time.Now().Before(state.startupUntil) {
+						x, y := pos.X, pos.Y
+						if pos.Flags&win.SWP_NOMOVE != 0 {
+							x, y = current.Left, current.Top
+						}
+						fitted := fitStartupRect(win.RECT{Left: x, Top: y, Right: x + pos.Cx, Bottom: y + pos.Cy}, work, persistedWindowPlacement{})
+						if fitted.Left != x || fitted.Top != y {
+							pos.X, pos.Y = fitted.Left, fitted.Top
+							pos.Flags &^= win.SWP_NOMOVE
+						}
+					}
 				}
 			}
+			sizeChanged := haveCurrent &&
+				(pos.Cx != current.Right-current.Left || pos.Cy != current.Bottom-current.Top)
+			pos.Flags = captionResizeFlags(pos.Flags, sizeChanged)
+			if pos != before {
+				copyCaptionMemory.Call(lp, uintptr(unsafe.Pointer(&pos)), unsafe.Sizeof(pos))
+			}
 		}
+		return result
+	case win.WM_ERASEBKGND:
+		// Keep GLFW's double-buffered surface intact during movement. A GDI
+		// fill here clears the frame before OpenGL can present the next one.
+		return 1
 	case win.WM_NCPAINT:
 		// DWM is disabled for the custom caption; don't let the classic
 		// Windows frame paint another title or set of buttons.
@@ -300,8 +383,8 @@ func hitTestWindowCaption(hwnd win.HWND, original, lp uintptr) uintptr {
 	return win.HTCAPTION
 }
 
-func captionResizeFlags(flags uint32) uint32 {
-	if flags&win.SWP_NOSIZE == 0 || flags&win.SWP_FRAMECHANGED != 0 {
+func captionResizeFlags(flags uint32, sizeChanged bool) uint32 {
+	if (flags&win.SWP_NOSIZE == 0 && sizeChanged) || flags&win.SWP_FRAMECHANGED != 0 {
 		return flags | win.SWP_NOCOPYBITS
 	}
 	return flags
